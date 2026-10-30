@@ -1,4 +1,4 @@
-// Click Before Frames v2.9 (cube-style wave, wave auto-release, orb alignment, full ghost state, drift check, in-game console on F9)
+// Testing (id basu.input-buffer) v2.9: Click Before Frames engine, no in-game UI. All settings live in config.json (cfg.hpp) and are driven from an external console over a named pipe.
 //
 // When you click (or release, in wave / robot), a hidden "ghost" player is simulated
 // ahead with your input. If the ghost dies, the input is retried with 1..N ticks of
@@ -13,7 +13,7 @@
 //    so taps and hold lengths are preserved (no more swallowed clicks / 1-tick taps).
 //  - Time budget per click so big windows don't hitch.
 //  - Fixes: ghost lifetime, init using `this`, time-warp dt, F6 only when GD focused,
-//    dead flipGravity hook priority, optional console, in-game console (stage + live log, hidden by default).
+//    dead flipGravity hook priority, optional console.
 
 #include <Geode/Geode.hpp>
 #include <Geode/modify/MenuLayer.hpp>
@@ -31,6 +31,9 @@
 #include <map>
 #include <Geode/modify/PlayerObject.hpp>
 #include <Geode/modify/RingObject.hpp>
+#include <Geode/modify/CCScheduler.hpp>
+#include "cfg.hpp"
+#include <atomic>
 #ifdef GEODE_IS_WINDOWS
 #include <Windows.h>
 #endif
@@ -42,7 +45,9 @@
 #include <climits>
 #include <cmath>
 #include <complex>
+#include <condition_variable>
 #include <deque>
+#include <mutex>
 #include <filesystem>
 #include <functional>
 #include <fstream>
@@ -57,7 +62,6 @@ using namespace geode::prelude;
 namespace {
     constexpr int HOOK_PRIORITY = -1000000;
     constexpr float TICK = 0.25f;
-    constexpr size_t PANEL_LINES = 8;
     constexpr int SPIDER_LAND = 12;  // v2.15: ticks on a surface after a spider input = safe
 
     constexpr uint64_t typeBit(GameObjectType type) {
@@ -154,16 +158,10 @@ namespace {
         CCLayer* ghostLayer = nullptr;
         unsigned ghostLayerBase = 0;  // v2.24: children the ghost layer has right after the ghosts are made
 
-        CCNode* panel = nullptr;
-        CCLabelBMFont* panelTitle = nullptr;               // current stage
-        std::vector<CCLabelBMFont*> panelLines;            // one label per log line (colored)
-        bool panelOpen = false;  // closed by default, remembered for the session
-        bool panelDirty = false; // v2.71: new log lines, the panel is redrawn once on the next step
         bool perfMode = false;   // v2.71: performance mode
         double userBudget = 6.0; // v2.75: the budget from the settings (budgetMs is this click's)
         bool autoBudget = true;  // v2.75: budget follows the frame rate
         std::unordered_set<GameObject*> simDisabled;  // v2.75: objects a toggle orb switched off in this prediction
-        std::deque<std::string> logLines;
 
         bool simulating = false;
         bool injecting = false;
@@ -267,6 +265,11 @@ namespace {
         bool heatmap = true;         // v2.51: death marks on the progress bar
         bool saveDing = true;        // v2.56: ding when a click is saved
         CCLabelBMFont* hintLabel = nullptr;  // v2.51: training hint ("2t early")
+        bool showHint = false;       // console toggle: draw the training hint text (off by default)
+        bool showAutoTag = false;    // console toggle: "AUTO INPUTS ON" tag (off by default)
+        bool showTpsText = false;    // console toggle: TPS text (off by default)
+        CCLabelBMFont* autoTagLabel = nullptr;
+        CCLabelBMFont* tpsLabel = nullptr;
         CCDrawNode* heatNode = nullptr;      // v2.51: death marks on the progress bar
         bool ufoSmart = true;        // v2.40: UFO landing + "could you have flapped again" scoring
         bool spiderSmart = true;     // v2.15: spider-aware landing + "could you have flipped back" scoring
@@ -274,8 +277,6 @@ namespace {
         bool robotSmart = true;      // v2.12: robot presses count as safe if some hold length survives
         bool robotAutoRelease = false;  // v2.12: robot auto-release (practice mode only)
         bool autoNormalRuns = false; // v2.14: let auto-release work outside practice too
-        CCLabelBMFont* autoTag = nullptr;  // v2.14: on-screen "AUTO-RELEASE ON" tag
-        CCLabelBMFont* watermark = nullptr;  // v2.46: always-on "Click Before Frames" label while the buffer is on
         bool usedThisAttempt = false;      // v2.46: the buffer was on at some point of this attempt
         bool learn = true;           // v2.13: per-level memory learned from your runs
         bool fullState = true;       // v2.11.1: copy the full v2.8 player state into the ghost
@@ -345,62 +346,399 @@ namespace {
         int maxAt = 0;
     } drift;
 
-    constexpr float PANEL_W = 320.f;
-    constexpr float PANEL_H = 178.f;
-
-    // Log line colors: saves green, orbs cyan, auto-release purple, misses grey,
-    // budget / skips orange, drift yellow.
-    ccColor3B lineColor(std::string const& line) {
-        auto starts = [&](char const* prefix) { return line.rfind(prefix, 0) == 0; };
-        if (starts("SAVED") || starts("MORE TIME")) return { 120, 255, 140 };
-        if (starts("ORB") || starts("orb")) return { 90, 220, 255 };
-        if (starts("AUTO")) return { 200, 150, 255 };
-        if (starts("no save")) return { 175, 175, 190 };
-        if (starts("skip") || starts("prediction budget")) return { 255, 180, 80 };
-        if (starts("drift")) return { 255, 240, 150 };
-        if (starts("ghost killed") || starts("  hitbox")) return { 255, 120, 120 };
-        if (starts("perf")) return { 150, 200, 255 };
-        if (starts("F6") || starts("stage") || starts("v2") || starts("path") || starts("Click") || starts("CBF")) return { 255, 215, 90 };
-        if (starts("pass")) return { 140, 150, 170 };
-        if (starts("memory")) return { 255, 150, 220 };
-        if (starts("console")) return { 150, 255, 200 };
-        return { 255, 255, 255 };
-    }
-
-    // In-game console (F9): current stage + the same live log the Windows console shows.
-    // Hidden by default; only touched when open, so it costs nothing while closed.
-    void refreshPanel() {
-        if (!buf.panel) {
-            return;
-        }
-        buf.panel->setVisible(buf.panelOpen);
-        if (!buf.panelOpen) {
-            return;
-        }
-        buf.panelTitle->setString(stageText().c_str());
-        buf.panelTitle->limitLabelWidth(PANEL_W - 20.f, 0.4f, 0.2f);
-        size_t first = buf.logLines.size() > buf.panelLines.size() ? buf.logLines.size() - buf.panelLines.size() : 0;
-        for (size_t i = 0; i < buf.panelLines.size(); ++i) {
-            auto* label = buf.panelLines[i];
-            size_t at = first + i;
-            if (at < buf.logLines.size()) {
-                auto const& line = buf.logLines[at];
-                label->setString(line.c_str());
-                label->setColor(lineColor(line));
-                label->limitLabelWidth(PANEL_W - 20.f, 0.55f, 0.3f);
-            }
-            else {
-                label->setString("");
-            }
-        }
-    }
-
-    // Log line -> in-game panel history, plus the Windows console if enabled.
-    // (Formatting a short string is cheap; it was the synchronous console writes
-    //  that hitched, and those still only happen with the console setting on.)
+    // Log line -> export history, plus the live Windows console (written by a background
+    // thread, so the game thread only formats a short string and queues it).
     // v2.29: the full log (not just the 8 lines on screen) for the F8 export, with the
     // physics step each line happened on.
     constexpr size_t EXPORT_LINES = 400;
+
+    // Console lines are handed to a writer thread: a Windows console write can block for
+    // milliseconds and say() is called from the 240/s physics loop. The thread touches
+    // nothing but its own queue and stdout (no game / Cocos objects).
+    class ConsoleSink {
+    public:
+        static ConsoleSink& get() {
+            static ConsoleSink* sink = new ConsoleSink();  // never freed: the thread outlives statics
+            return *sink;
+        }
+        void start() {
+            if (m_started) {
+                return;
+            }
+            m_started = true;
+            std::thread([this] { run(); }).detach();
+        }
+        void push(std::string line) {
+            if (!m_started) {
+                return;
+            }
+            {
+                std::lock_guard lock(m_mutex);
+                if (m_queue.size() >= 4000) {
+                    m_queue.pop_front();
+                }
+                m_queue.push_back(std::move(line));
+            }
+            m_cv.notify_one();
+        }
+    private:
+        void run() {
+            std::deque<std::string> batch;
+            for (;;) {
+                {
+                    std::unique_lock lock(m_mutex);
+                    m_cv.wait(lock, [this] { return !m_queue.empty(); });
+                    batch.swap(m_queue);
+                }
+                for (auto const& line : batch) {
+                    std::fputs(line.c_str(), stdout);
+                    std::fputc('\n', stdout);
+                }
+                std::fflush(stdout);
+                batch.clear();
+            }
+        }
+        std::mutex m_mutex;
+        std::condition_variable m_cv;
+        std::deque<std::string> m_queue;
+        bool m_started = false;
+    };
+    // ---------- external console link (named pipe) ----------
+    // Everything in here runs on its own threads and touches NO game / Cocos objects: it only
+    // parses and validates text, then queues commands. The game thread drains the queue
+    // (pumpPipe, in the CCScheduler hook). If no app is connected nothing is queued or sent.
+    struct Cmd {
+        std::string kind;   // hello | get_config | set | stage | preset | action | reset
+        std::string key;    // set: setting key
+        cfg::Val value;     // set / stage: the value
+        std::string name;   // preset / action / reset name
+        std::string id;     // optional correlation id (already JSON-encoded), echoed in the ack
+    };
+
+    class PipeServer {
+    public:
+        static PipeServer& get() {
+            static PipeServer* p = new PipeServer();  // never freed: threads outlive statics
+            return *p;
+        }
+        bool connected() const { return m_connected.load(); }
+        bool takeHello() { return m_hello.exchange(false); }
+        bool hasCommands() const { return m_hasCmds.load(); }
+
+        void send(std::string line) {
+            if (!m_connected.load()) {
+                return;
+            }
+            std::lock_guard lock(m_outMutex);
+            if (m_out.size() >= 6000) {
+                m_out.pop_front();
+            }
+            m_out.push_back(std::move(line));
+        }
+        void log(int tick, std::string const& msg) {
+            if (!m_connected.load()) {
+                return;
+            }
+            send("{\"type\":\"log\",\"tick\":" + std::to_string(tick) + ",\"msg\":" + cfg::jstr(msg) + "}");
+        }
+        bool pop(Cmd& out) {
+            std::lock_guard lock(m_cmdMutex);
+            if (m_cmds.empty()) {
+                m_hasCmds = false;
+                return false;
+            }
+            out = std::move(m_cmds.front());
+            m_cmds.pop_front();
+            m_hasCmds = !m_cmds.empty();
+            return true;
+        }
+        void start() {
+#ifdef GEODE_IS_WINDOWS
+            if (m_started.exchange(true)) {
+                return;
+            }
+            std::thread([this] { pipeLoop(); }).detach();
+            std::thread([this] { hotkeyLoop(); }).detach();
+#endif
+        }
+
+    private:
+        void pushCmd(Cmd c) {
+            std::lock_guard lock(m_cmdMutex);
+            if (m_cmds.size() >= 256) {
+                return;  // flooded: drop
+            }
+            m_cmds.push_back(std::move(c));
+            m_hasCmds = true;
+        }
+        void ack(Cmd const& c, std::string const& cmd, std::string const& err, std::string const& id) {
+            std::string o = "{\"type\":\"ack\",\"cmd\":" + cfg::jstr(cmd) + ",\"ok\":" + (err.empty() ? "true" : "false");
+            if (!err.empty()) {
+                o += ",\"error\":" + cfg::jstr(err);
+            }
+            if (!id.empty()) {
+                o += ",\"id\":" + id;
+            }
+            send(o + "}");
+        }
+
+        // Whitelist: known command, known key, right type, inside the range. Nothing else gets queued.
+        void handleLine(std::string const& line) {
+            cfg::Obj o;
+            std::string perr;
+            Cmd none;
+            if (!cfg::parseFlat(line, o, &perr)) {
+                ack(none, "?", "bad JSON: " + perr, "");
+                return;
+            }
+            std::string id;
+            if (auto it = o.find("id"); it != o.end() && (it->second.t == cfg::Val::Num || it->second.t == cfg::Val::Str)) {
+                id = cfg::jval(it->second);
+            }
+            auto cit = o.find("cmd");
+            if (cit == o.end() || cit->second.t != cfg::Val::Str) {
+                ack(none, "?", "missing \"cmd\"", id);
+                return;
+            }
+            std::string name = cit->second.s;
+            Cmd c;
+            c.kind = name;
+            c.id = id;
+            auto text = [&](char const* k) { auto it = o.find(k); return it != o.end() && it->second.t == cfg::Val::Str ? it->second.s : std::string(); };
+
+            if (name == "ping") {
+                send("{\"type\":\"pong\"" + (id.empty() ? std::string() : ",\"id\":" + id) + "}");
+                return;
+            }
+            if (name == "hello" || name == "get_config") {
+                pushCmd(std::move(c));
+                return;
+            }
+            if (name == "set") {
+                c.key = text("key");
+                auto vit = o.find("value");
+                if (vit == o.end()) {
+                    ack(c, name, "missing \"value\"", id);
+                    return;
+                }
+                c.value = vit->second;
+                std::string err = cfg::config().validate(c.key, c.value);
+                if (!err.empty()) {
+                    ack(c, name, err, id);
+                    return;
+                }
+                pushCmd(std::move(c));
+                return;
+            }
+            if (name == "stage") {
+                auto vit = o.find("value");
+                if (vit == o.end() || vit->second.t != cfg::Val::Num || vit->second.n < 0 || vit->second.n > STAGE_COUNT - 1 ||
+                    std::floor(vit->second.n) != vit->second.n) {
+                    ack(c, name, "stage needs a whole number 0.." + std::to_string(STAGE_COUNT - 1), id);
+                    return;
+                }
+                c.value = vit->second;
+                pushCmd(std::move(c));
+                return;
+            }
+            if (name == "preset") {
+                c.name = text("name");
+                if (c.name != "safe" && c.name != "balanced" && c.name != "aggressive") {
+                    ack(c, name, "preset must be safe, balanced or aggressive", id);
+                    return;
+                }
+                pushCmd(std::move(c));
+                return;
+            }
+            if (name == "action") {
+                c.name = text("name");
+                if (!validAction(c.name)) {
+                    ack(c, name, "unknown action '" + c.name + "'", id);
+                    return;
+                }
+                pushCmd(std::move(c));
+                return;
+            }
+            if (name == "reset") {
+                c.name = text("what");
+                if (c.name != "settings" && c.name != "binds" && c.name != "all") {
+                    ack(c, name, "what must be settings, binds or all", id);
+                    return;
+                }
+                pushCmd(std::move(c));
+                return;
+            }
+            ack(c, name, "unknown command", id);
+        }
+
+    public:
+        static bool validAction(std::string const& n) {
+            for (auto const& a : cfg::actions()) {
+                if (n == a.name) {
+                    return true;
+                }
+            }
+            if (n.rfind("toggle:", 0) == 0) {
+                auto const* sp = cfg::findSpec(n.substr(7));
+                return sp && sp->kind == cfg::Kind::Bool;
+            }
+            return false;
+        }
+
+    private:
+#ifdef GEODE_IS_WINDOWS
+        void pipeLoop() {
+            HANDLE h = CreateNamedPipeA("\\\\.\\pipe\\basu-input-buffer-testing", PIPE_ACCESS_DUPLEX,
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_NOWAIT | PIPE_REJECT_REMOTE_CLIENTS, 1, 1 << 16, 1 << 16, 0, nullptr);
+            if (h == INVALID_HANDLE_VALUE) {
+                return;
+            }
+            bool connected = false;
+            std::string inbuf, pending;
+            auto drop = [&] {
+                DisconnectNamedPipe(h);
+                connected = false;
+                m_connected = false;
+                inbuf.clear();
+                pending.clear();
+                std::lock_guard lock(m_outMutex);
+                m_out.clear();
+            };
+            for (;;) {
+                if (!connected) {
+                    BOOL ok = ConnectNamedPipe(h, nullptr);
+                    DWORD e = ok ? 0 : GetLastError();
+                    if (ok || e == ERROR_PIPE_CONNECTED) {
+                        connected = true;
+                        {
+                            std::lock_guard lock(m_outMutex);
+                            m_out.clear();
+                        }
+                        m_connected = true;
+                        m_hello = true;
+                    }
+                    else {
+                        if (e == ERROR_NO_DATA) {
+                            DisconnectNamedPipe(h);  // a client came and left before we noticed
+                        }
+                        Sleep(100);
+                        continue;
+                    }
+                }
+                // incoming
+                DWORD avail = 0;
+                if (!PeekNamedPipe(h, nullptr, 0, nullptr, &avail, nullptr)) {
+                    drop();
+                    continue;
+                }
+                while (avail > 0) {
+                    char chunk[4096];
+                    DWORD got = 0;
+                    if (!ReadFile(h, chunk, std::min<DWORD>(avail, sizeof chunk), &got, nullptr) || got == 0) {
+                        break;
+                    }
+                    avail -= std::min(avail, got);
+                    inbuf.append(chunk, got);
+                }
+                for (size_t nl; (nl = inbuf.find('\n')) != std::string::npos;) {
+                    std::string line = inbuf.substr(0, nl);
+                    inbuf.erase(0, nl + 1);
+                    if (!line.empty() && line.back() == '\r') {
+                        line.pop_back();
+                    }
+                    if (!line.empty()) {
+                        handleLine(line);
+                    }
+                }
+                if (inbuf.size() > 65536) {
+                    inbuf.clear();  // garbage without a newline
+                }
+                // outgoing
+                {
+                    std::lock_guard lock(m_outMutex);
+                    while (!m_out.empty()) {
+                        pending += m_out.front();
+                        pending += '\n';
+                        m_out.pop_front();
+                    }
+                }
+                if (pending.size() > (2u << 20)) {
+                    pending.clear();  // the app stopped reading: drop instead of growing forever
+                }
+                if (!pending.empty()) {
+                    DWORD wrote = 0;
+                    if (!WriteFile(h, pending.data(), static_cast<DWORD>(std::min<size_t>(pending.size(), 1 << 15)), &wrote, nullptr)) {
+                        drop();
+                        continue;
+                    }
+                    pending.erase(0, wrote);
+                }
+                Sleep(pending.empty() ? 5 : 1);
+            }
+        }
+
+        // Keys: polled while Geometry Dash is the foreground window. Nothing is registered with
+        // the system (no RegisterHotKey), so no key is taken from any other program.
+        void hotkeyLoop() {
+            struct Bind { std::string action; int vk; int mods; bool was; };
+            std::vector<Bind> binds;
+            auto lastLoad = std::chrono::steady_clock::now() - std::chrono::seconds(10);
+            for (;;) {
+                Sleep(8);
+                auto now = std::chrono::steady_clock::now();
+                if (now - lastLoad > std::chrono::milliseconds(250)) {
+                    lastLoad = now;
+                    std::vector<Bind> fresh;
+                    for (auto const& sp : cfg::specs()) {
+                        if (!cfg::isBind(sp.key)) {
+                            continue;
+                        }
+                        std::string v = cfg::s(sp.key.c_str());
+                        int vk = 0, mods = 0;
+                        if (!v.empty() && cfg::parseKey(v, vk, mods)) {
+                            bool was = false;
+                            for (auto const& old : binds) {
+                                if (old.action == sp.key.substr(5) && old.vk == vk && old.mods == mods) {
+                                    was = old.was;
+                                }
+                            }
+                            fresh.push_back({ sp.key.substr(5), vk, mods, was });
+                        }
+                    }
+                    binds.swap(fresh);
+                }
+                HWND fg = GetForegroundWindow();
+                DWORD pid = 0;
+                if (fg) {
+                    GetWindowThreadProcessId(fg, &pid);
+                }
+                bool focus = fg && pid == GetCurrentProcessId();
+                int mods = ((GetAsyncKeyState(VK_CONTROL) & 0x8000) ? cfg::CTRL : 0) | ((GetAsyncKeyState(VK_SHIFT) & 0x8000) ? cfg::SHIFT : 0) |
+                           ((GetAsyncKeyState(VK_MENU) & 0x8000) ? cfg::ALT : 0);
+                for (auto& b : binds) {
+                    bool down = (GetAsyncKeyState(b.vk) & 0x8000) != 0 && mods == b.mods;
+                    if (down && !b.was && focus) {
+                        Cmd c;
+                        c.kind = "action";
+                        c.name = b.action;
+                        pushCmd(std::move(c));
+                    }
+                    b.was = down;
+                }
+            }
+        }
+#endif
+
+        std::atomic<bool> m_connected{ false };
+        std::atomic<bool> m_hello{ false };
+        std::atomic<bool> m_hasCmds{ false };
+        std::atomic<bool> m_started{ false };
+        std::mutex m_cmdMutex, m_outMutex;
+        std::deque<Cmd> m_cmds;
+        std::deque<std::string> m_out;
+    };
+    std::string g_lastDecision;  // last SAVED / TRAIN line, for the console's state message
+
     std::deque<std::string> exportLines;
     int logClock = 0;  // physics steps since the level started, kept by the update hook
 
@@ -411,16 +749,13 @@ namespace {
         while (exportLines.size() > EXPORT_LINES) {
             exportLines.pop_front();
         }
-        buf.logLines.push_back(msg);
-        while (buf.logLines.size() > PANEL_LINES) {
-            buf.logLines.pop_front();
-        }
         if (buf.console) {
-            std::printf("[InputBuffer] %s\n", msg.c_str());
+            ConsoleSink::get().push(fmt::format("[{:>6}] {}", logClock, msg));
         }
-        // v2.71: redrawn once per physics step instead of on every line (a click that logs
-        // 4 lines rebuilt all 8 labels 4 times)
-        buf.panelDirty = buf.panelOpen;
+        if (msg.rfind("SAVED", 0) == 0 || msg.rfind("TRAIN", 0) == 0) {
+            g_lastDecision = fmt::format("[{}] {}", logClock, msg);
+        }
+        PipeServer::get().log(logClock, msg);
     }
 
     bool isGhost(PlayerObject* p) {
@@ -434,62 +769,64 @@ namespace {
     }
 
     void readSettings() {
-        auto* mod = Mod::get();
-        buf.smart = mod->getSettingValue<bool>("smart-prediction");
-        buf.budgetMs = mod->getSettingValue<double>("sim-budget-ms");
-        buf.autoBudget = mod->getSettingValue<bool>("auto-budget");
-        buf.practiceOnly = mod->getSettingValue<bool>("practice-only");
-        buf.groundHorizon = static_cast<int>(mod->getSettingValue<int64_t>("ground-horizon"));
-        buf.waveHorizon = static_cast<int>(mod->getSettingValue<int64_t>("wave-horizon"));
-        buf.assumeOrbs = mod->getSettingValue<bool>("orb-assume-hit");
+        buf.smart = cfg::b("smart-prediction");
+        buf.budgetMs = cfg::d("sim-budget-ms");
+        buf.autoBudget = cfg::b("auto-budget");
+        buf.practiceOnly = cfg::b("practice-only");
+        buf.groundHorizon = static_cast<int>(cfg::i("ground-horizon"));
+        buf.waveHorizon = static_cast<int>(cfg::i("wave-horizon"));
+        buf.assumeOrbs = cfg::b("orb-assume-hit");
         buf.orbClick = buf.assumeOrbs;
-        buf.tryBothOrbs = mod->getSettingValue<bool>("orb-try-both");
-        buf.avoidMovers = mod->getSettingValue<bool>("avoid-moving-objects");
-        buf.autoRelease = mod->getSettingValue<bool>("wave-auto-release");
-        buf.autoWindow = static_cast<int>(mod->getSettingValue<int64_t>("auto-release-window"));
-        buf.driftCheck = mod->getSettingValue<bool>("drift-check");
-        buf.spamGap = static_cast<int>(mod->getSettingValue<int64_t>("wave-spam-gap"));
-        buf.orbAlign = mod->getSettingValue<bool>("orb-align");
-        buf.orbTiming = mod->getSettingValue<bool>("orb-timing");
-        buf.orbAlignGround = mod->getSettingValue<bool>("orb-align-ground");
-        buf.fullState = mod->getSettingValue<bool>("full-ghost-state");
-        buf.learn = mod->getSettingValue<bool>("level-memory");
-        buf.robotSmart = mod->getSettingValue<bool>("robot-smart");
-        buf.spiderSmart = mod->getSettingValue<bool>("spider-smart");
-        buf.ufoSmart = mod->getSettingValue<bool>("ufo-smart");
-        buf.ballSmart = mod->getSettingValue<bool>("ball-smart");
-        buf.swingSmart = mod->getSettingValue<bool>("swing-smart");
-        buf.train = mod->getSettingValue<bool>("training-mode");
-        buf.perLevel = mod->getSettingValue<bool>("per-level-settings");
-        buf.heatmap = mod->getSettingValue<bool>("death-heatmap");
-        buf.saveDing = mod->getSettingValue<bool>("save-ding");
-        buf.moreTime = mod->getSettingValue<bool>("more-time-death-spots");
-        buf.dashAutoRelease = mod->getSettingValue<bool>("dash-auto-release");
-        buf.perfLog = mod->getSettingValue<bool>("perf-log");
-        buf.shipBuffer = mod->getSettingValue<bool>("ship-buffer");
-        buf.lateCrash = static_cast<int>(mod->getSettingValue<int64_t>("cube-late-crash"));
-        buf.robustSaves = mod->getSettingValue<bool>("robust-saves");
-        buf.ignoreTouching = mod->getSettingValue<bool>("ignore-touching-hazards");
-        buf.deathLog = mod->getSettingValue<bool>("death-log");
-        buf.explain = mod->getSettingValue<bool>("explain-inputs");
+        buf.tryBothOrbs = cfg::b("orb-try-both");
+        buf.avoidMovers = cfg::b("avoid-moving-objects");
+        buf.autoRelease = cfg::b("wave-auto-release");
+        buf.autoWindow = static_cast<int>(cfg::i("auto-release-window"));
+        buf.driftCheck = cfg::b("drift-check");
+        buf.spamGap = static_cast<int>(cfg::i("wave-spam-gap"));
+        buf.orbAlign = cfg::b("orb-align");
+        buf.orbTiming = cfg::b("orb-timing");
+        buf.orbAlignGround = cfg::b("orb-align-ground");
+        buf.fullState = cfg::b("full-ghost-state");
+        buf.learn = cfg::b("level-memory");
+        buf.robotSmart = cfg::b("robot-smart");
+        buf.spiderSmart = cfg::b("spider-smart");
+        buf.ufoSmart = cfg::b("ufo-smart");
+        buf.ballSmart = cfg::b("ball-smart");
+        buf.swingSmart = cfg::b("swing-smart");
+        buf.train = cfg::b("training-mode");
+        buf.perLevel = cfg::b("per-level-settings");
+        buf.heatmap = cfg::b("death-heatmap");
+        buf.saveDing = cfg::b("save-ding");
+        buf.showHint = cfg::b("show-hint-text");
+        buf.showAutoTag = cfg::b("show-auto-tag");
+        buf.showTpsText = cfg::b("show-tps-text");
+        buf.moreTime = cfg::b("more-time-death-spots");
+        buf.dashAutoRelease = cfg::b("dash-auto-release");
+        buf.perfLog = cfg::b("perf-log");
+        buf.shipBuffer = cfg::b("ship-buffer");
+        buf.lateCrash = static_cast<int>(cfg::i("cube-late-crash"));
+        buf.robustSaves = cfg::b("robust-saves");
+        buf.ignoreTouching = cfg::b("ignore-touching-hazards");
+        buf.deathLog = cfg::b("death-log");
+        buf.explain = cfg::b("explain-inputs");
         // v2.35 low latency mode: for players who feel the buffer as input lag. Short searches
         // (no frame hitches), at most 1 frame of delay, no extra "margin" ticks, and clicks
         // made while a delay is waiting aren't shifted (see intercept).
-        buf.predictMovers = mod->getSettingValue<bool>("predict-moving-objects");
-        buf.shipMaxDelay = static_cast<int>(mod->getSettingValue<int64_t>("ship-max-delay"));
-        buf.shipSpamGap = static_cast<int>(mod->getSettingValue<int64_t>("ship-spam-gap"));
-        buf.cbfSync = mod->getSettingValue<bool>("cbf-sync");
-        buf.robotAutoRelease = mod->getSettingValue<bool>("robot-auto-release");
-        buf.autoNormalRuns = mod->getSettingValue<bool>("auto-release-normal-runs");
-        buf.autoClick = mod->getSettingValue<bool>("auto-click");
-        buf.spamStreak = std::clamp(static_cast<int>(mod->getSettingValue<int64_t>("wave-spam-streak")), 2, 6);
-        buf.portalPredict = mod->getSettingValue<bool>("predict-through-portals");
-        buf.tps = std::clamp(static_cast<int>(mod->getSettingValue<int64_t>("tps")), 240, 1000);
-        buf.waveV46 = mod->getSettingValue<bool>("wave-v46");
-        buf.waveMargin = mod->getSettingValue<bool>("wave-safety-margin");
-        buf.orbWindow = static_cast<int>(mod->getSettingValue<int64_t>("orb-align-ticks"));
+        buf.predictMovers = cfg::b("predict-moving-objects");
+        buf.shipMaxDelay = static_cast<int>(cfg::i("ship-max-delay"));
+        buf.shipSpamGap = static_cast<int>(cfg::i("ship-spam-gap"));
+        buf.cbfSync = cfg::b("cbf-sync");
+        buf.robotAutoRelease = cfg::b("robot-auto-release");
+        buf.autoNormalRuns = cfg::b("auto-release-normal-runs");
+        buf.autoClick = cfg::b("auto-click");
+        buf.spamStreak = std::clamp(static_cast<int>(cfg::i("wave-spam-streak")), 2, 6);
+        buf.portalPredict = cfg::b("predict-through-portals");
+        buf.tps = std::clamp(static_cast<int>(cfg::i("tps")), 240, 1000);
+        buf.waveV46 = cfg::b("wave-v46");
+        buf.waveMargin = cfg::b("wave-safety-margin");
+        buf.orbWindow = static_cast<int>(cfg::i("orb-align-ticks"));
         // v2.79: read last, so its overrides stick (the wave margin used to be read again after it)
-        buf.lowLatency = mod->getSettingValue<bool>("low-latency");
+        buf.lowLatency = cfg::b("low-latency");
         if (buf.lowLatency) {
             buf.budgetMs = std::min(buf.budgetMs, 3.0);
             buf.robustSaves = false;
@@ -498,7 +835,7 @@ namespace {
         // v2.71 performance mode: for PCs that drop frames on clicks. Shorter searches, no
         // extra robustness runs, orbs clicked only the normal way (no late-click retries), and
         // the debug runs (drift check, live path view) off.
-        buf.perfMode = mod->getSettingValue<bool>("performance-mode");
+        buf.perfMode = cfg::b("performance-mode");
         if (buf.perfMode) {
             buf.budgetMs = std::min(buf.budgetMs, 4.0);
             buf.robustSaves = false;
@@ -534,39 +871,13 @@ namespace {
         auto const& s = STAGES[buf.stage];
         buf.enabled = s.enabled;
         if (s.custom) {
-            buf.ticksAll = static_cast<int>(Mod::get()->getSettingValue<int64_t>("custom-ticks"));
-            buf.ticksWave = static_cast<int>(Mod::get()->getSettingValue<int64_t>("custom-wave-ticks"));
+            buf.ticksAll = static_cast<int>(cfg::i("custom-ticks"));
+            buf.ticksWave = static_cast<int>(cfg::i("custom-wave-ticks"));
         }
         else {
             buf.ticksAll = s.ticksAll;
             buf.ticksWave = s.ticksWave;
         }
-    }
-
-    // v2.14: a run outside practice where auto-release can press for you is marked on screen.
-    // v2.46 watermark: whenever the buffer is on (any stage but OFF) the level shows it, and
-    // can't be turned off, so runs made with the mod are recognisable.
-    void refreshWatermark() {
-        if (!buf.watermark) {
-            return;
-        }
-        // v2.57: hidden in practice mode (practice runs can't be submitted, and it crowded the
-        // checkpoint buttons); always shown in normal mode while the buffer is on.
-        auto* layer = GameManager::get()->m_playLayer;
-        buf.watermark->setVisible(buf.enabled && !(layer && layer->m_isPracticeMode));
-        // v2.79: a custom TPS is always shown
-        auto tpsText = buf.tps != 240 ? fmt::format("  |  {} TPS", buf.tps) : std::string();
-        buf.watermark->setString(fmt::format("Click Before Frames  |  {}{}", stageText(), tpsText).c_str());
-    }
-
-    void refreshAutoTag() {
-        if (!buf.autoTag) {
-            return;
-        }
-        auto* layer = GameManager::get()->m_playLayer;
-        bool on = buf.enabled && buf.autoNormalRuns && (buf.autoRelease || buf.robotAutoRelease || buf.dashAutoRelease || buf.autoClick) && layer &&
-            !layer->m_isPracticeMode;
-        buf.autoTag->setVisible(on);
     }
 
     size_t memorySpots();
@@ -578,7 +889,7 @@ namespace {
         auto* mod = Mod::get();
         auto* layer = GameManager::get()->m_playLayer;
         std::string text;
-        text += fmt::format("Click Before Frames {} console export\n", mod->getVersion().toVString());
+        text += fmt::format("Testing {} console export\n", mod->getVersion().toVString());
         if (layer && layer->m_level) {
             text += fmt::format("Level: {} (id {}){}\n", std::string(layer->m_level->m_levelName), layer->m_level->m_levelID.value(),
                 layer->m_isPracticeMode ? ", practice" : "");
@@ -625,15 +936,6 @@ namespace {
     }
 
     void dropGhosts() {
-#ifdef GEODE_IS_ANDROID
-        // v2.87 Android: the ghosts are linked to the level that is closing, and deleting them
-        // while it was being torn down crashed on Android (the freed memory is reused at once,
-        // so the crash showed up in random other mods: music, labels, the scheduler). They're
-        // only let go of here; a hidden player per level is a small cost.
-        buf.ghost1 = nullptr;
-        buf.ghost2 = nullptr;
-        buf.ghostLayer = nullptr;
-#else
         for (auto** g : { &buf.ghost1, &buf.ghost2 }) {
             if (*g) {
                 (*g)->removeFromParentAndCleanup(true);
@@ -646,14 +948,7 @@ namespace {
             buf.ghostLayer->release();
             buf.ghostLayer = nullptr;
         }
-#endif
-        // panel nodes are owned by the PlayLayer
-        buf.panel = nullptr;
-        buf.panelTitle = nullptr;
-        buf.panelLines.clear();
         buf.pathNode = nullptr;
-        buf.autoTag = nullptr;
-        buf.watermark = nullptr;
         buf.simulating = false;
         buf.injecting = false;
         buf.rapid = 0;
@@ -2705,7 +3000,7 @@ namespace {
         }
         noteSave(layer, ticks);
         say("TRAIN {} {}: {}t ({:g}f) early", what, down ? "press" : "release", ticks, ticks * TICK);
-        if (buf.hintLabel) {
+        if (buf.hintLabel && buf.showHint) {
             buf.hintLabel->setString(fmt::format("{} {:g}f early", down ? "click" : "release", ticks * TICK).c_str());
             buf.hintLabel->stopAllActions();
             buf.hintLabel->setOpacity(230);
@@ -2738,7 +3033,7 @@ namespace {
         }
         auto v = matjson::Value::object();
         for (auto* key : PROFILE_KEYS) {
-            v[key] = Mod::get()->getSettingValue<bool>(key);
+            v[key] = cfg::b(key);
         }
         Mod::get()->setSavedValue(profileKey(), v);
     }
@@ -2749,7 +3044,7 @@ namespace {
         }
         auto* mod = Mod::get();
         for (size_t i = 0; i < std::size(PROFILE_KEYS); ++i) {
-            mod->setSettingValue<bool>(PROFILE_KEYS[i], globals.values[i]);
+            cfg::setTemp(PROFILE_KEYS[i], globals.values[i]);
         }
         globals = {};
         mod->setSavedValue("profile-globals", matjson::Value(nullptr));
@@ -2766,7 +3061,7 @@ namespace {
         globals.values.clear();
         auto backup = matjson::Value::object();
         for (auto* key : PROFILE_KEYS) {
-            bool value = mod->getSettingValue<bool>(key);
+            bool value = cfg::b(key);
             globals.values.push_back(value);
             backup[key] = value;
         }
@@ -2781,7 +3076,7 @@ namespace {
         }
         for (auto* key : PROFILE_KEYS) {
             if (v.contains(key)) {
-                mod->setSettingValue<bool>(key, v[key].asBool().unwrapOr(mod->getSettingValue<bool>(key)));
+                cfg::setTemp(key, v[key].asBool().unwrapOr(cfg::b(key)));
             }
         }
         readSettings();
@@ -2801,7 +3096,7 @@ namespace {
         }
         for (auto* key : PROFILE_KEYS) {
             if (v.contains(key)) {
-                mod->setSettingValue<bool>(key, v[key].asBool().unwrapOr(mod->getSettingValue<bool>(key)));
+                cfg::setTemp(key, v[key].asBool().unwrapOr(cfg::b(key)));
             }
         }
         mod->setSavedValue("profile-globals", matjson::Value(nullptr));
@@ -2835,6 +3130,18 @@ namespace {
             float x = 2.f + pct * (size.width - 4.f);
             float heat = static_cast<float>(spot.deaths) / most;
             buf.heatNode->drawSegment({ x, 2.f }, { x, size.height - 2.f }, 0.7f, { 1.f, 0.35f + 0.3f * (1.f - heat), 0.55f, 0.35f + 0.6f * heat });
+        }
+    }
+
+    // Console toggles: the AUTO INPUTS ON tag and the TPS text (both off by default).
+    void refreshOverlays() {
+        bool autoOn = buf.autoRelease || buf.robotAutoRelease || buf.dashAutoRelease || buf.autoClick;
+        if (buf.autoTagLabel) {
+            buf.autoTagLabel->setVisible(buf.showAutoTag && autoOn);
+        }
+        if (buf.tpsLabel) {
+            buf.tpsLabel->setString(fmt::format("TPS {}", buf.tps).c_str());
+            buf.tpsLabel->setVisible(buf.showTpsText);
         }
     }
 
@@ -3393,8 +3700,14 @@ namespace {
         return true;
     }
 
+    void setStage(int stage);
+
     void cycleStage(int dir = 1) {
-        buf.stage = (buf.stage + dir + STAGE_COUNT) % STAGE_COUNT;
+        setStage((buf.stage + dir + STAGE_COUNT) % STAGE_COUNT);
+    }
+
+    void setStage(int stage) {
+        buf.stage = stage;
         // v2.59: the stage is one setting for every level and survives restarts
         Mod::get()->setSavedValue("stage", buf.stage);
         resetPending();
@@ -3408,9 +3721,6 @@ namespace {
         readSettings();
         saveProfile();
         say("stage -> {}", stageText());
-        refreshAutoTag();
-        refreshWatermark();
-        refreshPanel();
     }
 
     // v2.4 wave auto-release (practice mode only): while you hold in wave, check every
@@ -3583,396 +3893,12 @@ namespace {
     }
 }
 
-// v2.44 in-game menu: pause menu button or F7 in a level. Stage, the main switches,
-// status, and shortcuts to all settings / copy log / forget level.
-class BufferMenu : public geode::Popup {
-    struct Option {
-        char const* key;    // mod setting, or nullptr for the runtime path view
-        char const* label;
-    };
-    static constexpr Option OPTIONS[] = {
-        { "low-latency", "Low latency" },
-        { "robust-saves", "Robust saves" },
-        { "orb-align", "Orb alignment" },
-        { "orb-timing", "Orb timing" },
-        { "level-memory", "Level memory" },
-        { "more-time-death-spots", "More time (death spots)" },
-        { "ship-buffer", "Ship buffering" },
-        { "ufo-smart", "Smart UFO" },
-        { "ball-smart", "Smart ball" },
-        { "swing-smart", "Smart swing" },
-        { "cbf-sync", "CBF sync" },
-        { "predict-moving-objects", "Predict moving objects" },
-        { nullptr, "Path view (F10)" },
-        { "training-mode", "Training (hints only)" },
-        { "death-heatmap", "Death heatmap" },
-        { "save-ding", "Ding on save" },
-        { "performance-mode", "Performance mode" },
-        { "auto-click", "Auto-click (practice)" },
-        { "explain-inputs", "Explain inputs (debug)" },
-    };
-
-    // v2.50: cute theme. v2.75: colour themes (setting "Menu theme")
-    struct Theme {
-        ccColor3B main, soft, accent, bg;
-        char const* button;
-    };
-
-public:
-    static Theme currentTheme() {
-        auto name = Mod::get()->getSettingValue<std::string>("menu-theme");
-        if (name == "Pink") {
-            return { { 255, 150, 205 }, { 255, 205, 230 }, { 215, 190, 255 }, { 255, 195, 235 }, "GJ_button_02.png" };
-        }
-        if (name == "Blue") {
-            return { { 120, 180, 255 }, { 205, 228, 255 }, { 170, 210, 255 }, { 170, 205, 255 }, "GJ_button_06.png" };
-        }
-        if (name == "Green") {
-            return { { 120, 230, 150 }, { 210, 255, 220 }, { 180, 240, 200 }, { 170, 235, 190 }, "GJ_button_01.png" };
-        }
-        if (name == "Dark") {
-            return { { 200, 160, 255 }, { 225, 225, 235 }, { 170, 170, 190 }, { 90, 85, 110 }, "GJ_button_04.png" };
-        }
-        // v2.79: purple, the default
-        return { { 185, 130, 255 }, { 225, 205, 255 }, { 255, 170, 225 }, { 205, 175, 255 }, "GJ_button_02.png" };
-    }
-
-private:
-    Theme m_t = currentTheme();
-
-    CCLabelBMFont* m_stage = nullptr;
-    CCLabelBMFont* m_status = nullptr;
-    CCLabelBMFont* m_tpsLabel = nullptr;
-
-    static constexpr int TPS_MIN = 240;
-    static constexpr int TPS_MAX = 1000;
-    std::vector<CCLabelBMFont*> m_labels;
-
-    static CCSprite* heart(float scale, ccColor3B color) {
-        auto* sprite = CCSprite::create("heart.png"_spr);
-        sprite->setScale(scale);
-        sprite->setColor(color);
-        return sprite;
-    }
-
-    static void pulse(CCNode* node, float scale) {
-        node->runAction(CCRepeatForever::create(CCSequence::create(CCEaseSineInOut::create(CCScaleTo::create(0.45f, scale * 1.18f)),
-            CCEaseSineInOut::create(CCScaleTo::create(0.45f, scale)), nullptr)));
-    }
-
-    // hearts and sparkles drifting up behind the switches; the tag holds the rise time (x10)
-    void addFloaters() {
-        for (int i = 0; i < 9; ++i) {
-            bool sparkle = i % 3 == 2;
-            auto* sprite = sparkle ? CCSprite::create("sparkle.png"_spr) : heart(0.3f + 0.05f * (i % 3), i % 2 ? m_t.main : m_t.accent);
-            if (sparkle) {
-                sprite->setScale(0.35f);
-            }
-            sprite->setOpacity(0);
-            sprite->setPosition({ 20.f + 340.f * ((i * 37) % 100) / 100.f, 20.f });
-            sprite->setTag(50 + 10 * (i % 4));
-            sprite->runAction(CCSequence::create(CCDelayTime::create(0.7f * i),
-                CCCallFuncN::create(this, callfuncN_selector(BufferMenu::loopFloater)), nullptr));
-            m_mainLayer->addChild(sprite, -1);
-        }
-    }
-
-    void loopFloater(CCNode* node) {
-        float rise = node->getTag() / 10.f;
-        node->runAction(CCRepeatForever::create(CCSequence::create(
-            CCSpawn::create(CCMoveBy::create(rise, { 0.f, 270.f }),
-                CCSequence::create(CCFadeTo::create(rise * 0.3f, 110), CCDelayTime::create(rise * 0.4f), CCFadeTo::create(rise * 0.3f, 0),
-                    nullptr),
-                nullptr),
-            CCPlace::create(node->getPosition()), nullptr)));
-    }
-
-    void colorLabels() {
-        for (size_t i = 0; i < m_labels.size(); ++i) {
-            m_labels[i]->setColor(optionValue(OPTIONS[i]) ? m_t.soft : ccColor3B { 170, 160, 185 });
-        }
-    }
-
-    static bool optionValue(Option const& o) {
-        return o.key ? Mod::get()->getSettingValue<bool>(o.key) : buf.showPath;
-    }
-
-    void refresh() {
-        m_stage->setString(stageText().c_str());
-        m_stage->limitLabelWidth(200.f, 0.5f, 0.2f);
-        float dt = buf.tickLength > 0.001f ? buf.tickLength : TICK;
-        m_status->setString(fmt::format("physics {:.0f}/s  |  CBF {}  |  memory {} spots", 60.f / dt,
-            Loader::get()->isModLoaded("syzzi.click_between_frames") ? "on" : "off", memorySpots()).c_str());
-        colorLabels();
-    }
-
-    void onToggle(CCObject* sender) {
-        auto const& o = OPTIONS[sender->getTag()];
-        bool value = !optionValue(o);
-        if (o.key) {
-            Mod::get()->setSettingValue<bool>(o.key, value);
-            readSettings();
-            saveProfile();
-            refreshHeatmap();
-            refreshWatermark();
-            refreshAutoTag();
-        }
-        else {
-            buf.showPath = value;
-            if (buf.pathNode) {
-                buf.pathNode->clear();
-            }
-        }
-        say("{} {}", o.label, value ? "on" : "off");
-        refresh();
-    }
-
-    void onStage(CCObject* sender) {
-        cycleStage(sender->getTag());
-        refresh();
-    }
-
-    // v2.79: physics TPS slider (240-1000, steps of 10)
-    void onTps(CCObject* sender) {
-        float value = static_cast<SliderThumb*>(sender)->getValue();
-        int tps = TPS_MIN + static_cast<int>(std::lround(value * (TPS_MAX - TPS_MIN) / 10.f)) * 10;
-        Mod::get()->setSettingValue<int64_t>("tps", tps);
-        readSettings();
-        refreshWatermark();
-        m_tpsLabel->setString(fmt::format("TPS: {}{}", tps, tps == 240 ? " (normal)" : "").c_str());
-    }
-
-    void onAllSettings(CCObject*) {
-        geode::openSettingsPopup(Mod::get());
-    }
-
-    void onCopyLog(CCObject*) {
-        exportConsole();
-    }
-
-    void onConsole(CCObject*) {
-        buf.panelOpen = !buf.panelOpen;
-        refreshPanel();
-        say("console {}", buf.panelOpen ? "shown" : "hidden");
-    }
-
-    // v2.75 presets: stage + the switches that matter most, in one click
-    void onPreset(CCObject* sender) {
-        auto* mod = Mod::get();
-        int which = sender->getTag();
-        int stage = which == 0 ? 2 : which == 1 ? 3 : 5;  // 2f / 4f / 8f
-        mod->setSettingValue<bool>("robust-saves", true);
-        mod->setSettingValue<bool>("wave-safety-margin", which != 2);
-        mod->setSettingValue<bool>("more-time-death-spots", which != 0);
-        mod->setSettingValue<bool>("low-latency", false);
-        buf.stage = stage;
-        mod->setSavedValue("stage", buf.stage);
-        resetPending();
-        applyStage();
-        readSettings();
-        refreshWatermark();
-        refreshPanel();
-        say("preset: {} -> {}", which == 0 ? "Safe" : which == 1 ? "Balanced" : "Aggressive", stageText());
-        refresh();
-    }
-
-    void onRunCheck(CCObject*) {
-        benchPending = true;
-        say("run check: runs at the start of your next attempt from the beginning (restart the level)");
-        FLAlertLayer::create("Run check",
-            "Restart the level from the beginning: your longest recorded run is replayed on the hidden player and the "
-            "result shows in the console (F9) and in Stats.",
-            "OK")->show();
-    }
-
-    void onStats(CCObject*) {
-        FLAlertLayer::create("Practice stats", statsText(), "OK")->show();
-    }
-
-    void onForget(CCObject*) {
-        memory.clear();
-        pending.active = false;
-        memoryDirty = true;
-        saveMemory();
-        refreshHeatmap();
-        say("memory for this level cleared");
-        refresh();
-    }
-
-    CCMenuItemSpriteExtra* textButton(char const* text, SEL_MenuHandler handler, float scale = 0.6f) {
-        auto* sprite = ButtonSprite::create(text, "bigFont.fnt", m_t.button, 0.8f);
-        sprite->setScale(scale);
-        return CCMenuItemSpriteExtra::create(sprite, this, handler);
-    }
-
-protected:
-    bool init() {
-        if (!Popup::init(380.f, MENU_HEIGHT, "GJ_square04.png")) {
-            return false;
-        }
-        m_bgSprite->setColor(m_t.bg);
-        this->setTitle("Click Before Frames");
-        if (m_title) {
-            m_title->setColor(m_t.soft);
-        }
-        addFloaters();
-
-        // hearts around the title
-        for (float side : { -1.f, 1.f }) {
-            auto* h = heart(0.32f, m_t.main);
-            h->setRotation(side * 15.f);
-            m_mainLayer->addChildAtPosition(h, Anchor::Top, { side * 118.f, -20.f });
-            pulse(h, 0.32f);
-            auto* sp = CCSprite::create("sparkle.png"_spr);
-            sp->setScale(0.25f);
-            sp->setColor(m_t.soft);
-            m_mainLayer->addChildAtPosition(sp, Anchor::Top, { side * 134.f, -10.f });
-            sp->runAction(CCRepeatForever::create(CCRotateBy::create(3.f, side * 360.f)));
-        }
-
-        // your own icon, with a little heart
-        auto* gm = GameManager::get();
-        auto* icon = SimplePlayer::create(gm->getPlayerFrame());
-        icon->updatePlayerFrame(gm->getPlayerFrame(), IconType::Cube);
-        icon->setColor(gm->colorForIdx(gm->getPlayerColor()));
-        icon->setSecondColor(gm->colorForIdx(gm->getPlayerColor2()));
-        icon->setScale(0.7f);
-        m_mainLayer->addChildAtPosition(icon, Anchor::TopLeft, { 34.f, -30.f });
-        icon->runAction(CCRepeatForever::create(CCSequence::create(CCEaseSineInOut::create(CCMoveBy::create(0.8f, { 0.f, 3.f })),
-            CCEaseSineInOut::create(CCMoveBy::create(0.8f, { 0.f, -3.f })), nullptr)));
-        auto* iconHeart = heart(0.2f, m_t.main);
-        m_mainLayer->addChildAtPosition(iconHeart, Anchor::TopLeft, { 52.f, -16.f });
-        pulse(iconHeart, 0.2f);
-
-        // stage row
-        auto* prev = CCMenuItemSpriteExtra::create(CCSprite::createWithSpriteFrameName("GJ_arrow_01_001.png"), this,
-            menu_selector(BufferMenu::onStage));
-        prev->setTag(-1);
-        prev->setScale(0.6f);
-        prev->m_baseScale = 0.6f;
-        m_buttonMenu->addChildAtPosition(prev, Anchor::Top, { -130.f, -52.f });
-        auto* nextSprite = CCSprite::createWithSpriteFrameName("GJ_arrow_01_001.png");
-        nextSprite->setFlipX(true);
-        auto* next = CCMenuItemSpriteExtra::create(nextSprite, this, menu_selector(BufferMenu::onStage));
-        next->setTag(1);
-        next->setScale(0.6f);
-        next->m_baseScale = 0.6f;
-        m_buttonMenu->addChildAtPosition(next, Anchor::Top, { 130.f, -52.f });
-        m_stage = CCLabelBMFont::create("", "bigFont.fnt");
-        m_mainLayer->addChildAtPosition(m_stage, Anchor::Top, { 0.f, -52.f });
-
-        // switches, two columns
-        constexpr int ROWS = 10;
-        for (int i = 0; i < static_cast<int>(std::size(OPTIONS)); ++i) {
-            int col = i / ROWS;
-            int row = i % ROWS;
-            CCPoint at { col == 0 ? -165.f : 15.f, -86.f - row * 24.f };
-            auto* toggler = CCMenuItemToggler::createWithStandardSprites(this, menu_selector(BufferMenu::onToggle), 0.55f);
-            toggler->setTag(i);
-            toggler->toggle(optionValue(OPTIONS[i]));
-            m_buttonMenu->addChildAtPosition(toggler, Anchor::Top, at);
-            auto* label = CCLabelBMFont::create(OPTIONS[i].label, "bigFont.fnt");
-            label->setAnchorPoint({ 0.f, 0.5f });
-            label->limitLabelWidth(140.f, 0.38f, 0.2f);
-            m_mainLayer->addChildAtPosition(label, Anchor::Top, at + CCPoint { 16.f, 0.f });
-            m_labels.push_back(label);
-        }
-
-        // v2.79: physics TPS slider
-        int tps = buf.tps;
-        m_tpsLabel = CCLabelBMFont::create(fmt::format("TPS: {}{}", tps, tps == 240 ? " (normal)" : "").c_str(), "bigFont.fnt");
-        m_tpsLabel->setScale(0.4f);
-        m_tpsLabel->setColor(m_t.soft);
-        m_mainLayer->addChildAtPosition(m_tpsLabel, Anchor::Bottom, { -120.f, 112.f });
-        auto* slider = Slider::create(this, menu_selector(BufferMenu::onTps), 0.6f);
-        slider->setValue(static_cast<float>(tps - TPS_MIN) / (TPS_MAX - TPS_MIN));
-        m_mainLayer->addChildAtPosition(slider, Anchor::Bottom, { 45.f, 112.f });
-
-        // status + shortcuts
-        m_status = CCLabelBMFont::create("", "chatFont.fnt");
-        m_status->setScale(0.55f);
-        m_status->setColor(m_t.accent);
-        m_mainLayer->addChildAtPosition(m_status, Anchor::Bottom, { 0.f, 56.f });
-        // v2.82: a Console button too, for phones (no F9 key)
-        m_buttonMenu->addChildAtPosition(textButton("Settings", menu_selector(BufferMenu::onAllSettings), 0.48f), Anchor::Bottom,
-            { -144.f, 26.f });
-        m_buttonMenu->addChildAtPosition(textButton("Stats", menu_selector(BufferMenu::onStats), 0.48f), Anchor::Bottom, { -74.f, 26.f });
-        m_buttonMenu->addChildAtPosition(textButton("Console", menu_selector(BufferMenu::onConsole), 0.48f), Anchor::Bottom,
-            { -4.f, 26.f });
-        m_buttonMenu->addChildAtPosition(textButton("Copy log", menu_selector(BufferMenu::onCopyLog), 0.48f), Anchor::Bottom,
-            { 74.f, 26.f });
-        m_buttonMenu->addChildAtPosition(textButton("Forget", menu_selector(BufferMenu::onForget), 0.48f), Anchor::Bottom,
-            { 148.f, 26.f });
-
-        // presets + run check
-        char const* presets[] = { "Safe", "Balanced", "Aggressive" };
-        for (int i = 0; i < 3; ++i) {
-            auto* button = textButton(presets[i], menu_selector(BufferMenu::onPreset), 0.5f);
-            button->setTag(i);
-            m_buttonMenu->addChildAtPosition(button, Anchor::Bottom, { -132.f + 82.f * i, 82.f });
-        }
-        m_buttonMenu->addChildAtPosition(textButton("Run check", menu_selector(BufferMenu::onRunCheck), 0.5f), Anchor::Bottom,
-            { 124.f, 82.f });
-
-        refresh();
-        return true;
-    }
-
-public:
-    // v2.56: the menu opens at 78% size (the popup's own pop-in animation scales it back to
-    // 100%, so it's re-run with the smaller target)
-    void show() override {
-        Popup::show();
-        m_mainLayer->stopAllActions();
-        m_mainLayer->setScale(0.1f);
-        // v2.79: smaller when the taller menu wouldn't fit on screen at 78%
-        float fit = (CCDirector::get()->getWinSize().height - 12.f) / MENU_HEIGHT;
-        m_mainLayer->runAction(CCEaseElasticOut::create(CCScaleTo::create(0.5f, std::min(MENU_SCALE, fit)), 0.6f));
-    }
-
-    static constexpr float MENU_HEIGHT = 444.f;  // v2.79: was 412, the TPS slider sits above the presets
-    static constexpr float MENU_SCALE = 0.78f;
-
-    static BufferMenu* create() {
-        auto* ret = new BufferMenu();
-        if (ret->init()) {
-            ret->autorelease();
-            return ret;
-        }
-        delete ret;
-        return nullptr;
-    }
-
-    static void open() {
-        if (auto* menu = create()) {
-            menu->show();
-        }
-    }
-};
-
-// v2.46: the level complete screen says so if the buffer was on during the attempt.
+// v2.46: end of a completed attempt. (The on-screen "was on" labels are gone; the bookkeeping stays.)
 class $modify(BufEndLevelLayer, EndLevelLayer) {
     void customSetup() {
         EndLevelLayer::customSetup();
         if (!buf.usedThisAttempt) {
             return;
-        }
-        auto win = CCDirector::get()->getWinSize();
-        auto* label = CCLabelBMFont::create("Click Before Frames was on", "bigFont.fnt");
-        label->setScale(0.35f);
-        label->setColor({ 150, 205, 255 });
-        label->setOpacity(170);
-        label->setAnchorPoint({ 1.f, 1.f });
-        label->setPosition({ win.width - 6.f, win.height - 4.f });
-        this->addChild(label, 100);
-        if (attemptStats.saves > 0) {
-            auto* stats = CCLabelBMFont::create(attemptSummary().c_str(), "bigFont.fnt");
-            stats->setScale(0.28f);
-            stats->setColor({ 255, 190, 225 });
-            stats->setOpacity(170);
-            stats->setAnchorPoint({ 1.f, 1.f });
-            stats->setPosition({ win.width - 6.f, win.height - 16.f });
-            this->addChild(stats, 100);
         }
         benchFinish();  // a completed run is the best recording there is
         benchFlush();
@@ -3980,57 +3906,50 @@ class $modify(BufEndLevelLayer, EndLevelLayer) {
     }
 };
 
-class $modify(BufPauseLayer, PauseLayer) {
-    void customSetup() {
-        PauseLayer::customSetup();
-        auto* sprite = ButtonSprite::create("Buffer", "bigFont.fnt", BufferMenu::currentTheme().button, 0.8f);
-        sprite->setScale(0.6f);
-        auto* button = CCMenuItemSpriteExtra::create(sprite, this, menu_selector(BufPauseLayer::onBufferMenu));
-        auto* menu = CCMenu::create();
-        menu->addChild(button);
-        auto win = CCDirector::get()->getWinSize();
-        menu->setPosition({ win.width - 50.f, 30.f });
-        this->addChild(menu, 10);
-    }
-
-    void onBufferMenu(CCObject*) {
-        BufferMenu::open();
-    }
-};
-
 $on_mod(Loaded) {
-    buf.console = Mod::get()->getSettingValue<bool>("debug-console");
-    buf.showPath = Mod::get()->getSettingValue<bool>("show-path");
+    cfg::config().init(Mod::get()->getSaveDir());
+    buf.showPath = cfg::b("show-path");
     recoverGlobals();
     buf.stage = std::clamp(static_cast<int>(Mod::get()->getSavedValue<int64_t>("stage", 0)), 0, STAGE_COUNT - 1);
     // v2.62: per-level settings off (switched off once): every level uses the same switches, like v2.43.1
     if (!Mod::get()->getSavedValue<bool>("per-level-v262", false)) {
-        Mod::get()->setSettingValue<bool>("per-level-settings", false);
+        cfg::setTemp("per-level-settings", false);
         Mod::get()->setSavedValue("per-level-v262", true);
     }
     // v2.60: low latency is off for every level (switched off once for existing installs too;
     // it's one setting for all levels, not saved per level)
     if (!Mod::get()->getSavedValue<bool>("low-latency-v260", false)) {
-        Mod::get()->setSettingValue<bool>("low-latency", false);
+        cfg::setTemp("low-latency", false);
         Mod::get()->setSavedValue("low-latency-v260", true);
     }
     readSettings();
     applyStage();
 #ifdef GEODE_IS_WINDOWS
-    if (buf.console) {
-        AllocConsole();
+    // The live console is the only output: it opens with the game. Its close button is
+    // removed, because closing a console window would close Geometry Dash with it.
+    // (If the game already has a console, e.g. Geode's own, AllocConsole fails and the log
+    // simply goes to that one.)
+    if (AllocConsole()) {
         FILE* out = nullptr;
         freopen_s(&out, "CONOUT$", "w", stdout);
-        SetConsoleTitleA("Click Before Frames - Live Console");
+        SetConsoleTitleA("Testing - Live Console");
+        if (HWND window = GetConsoleWindow()) {
+            if (HMENU menu = GetSystemMenu(window, FALSE)) {
+                DeleteMenu(menu, SC_CLOSE, MF_BYCOMMAND);
+            }
+        }
     }
+    buf.console = true;
+    ConsoleSink::get().start();
 #endif
+    PipeServer::get().start();
     if (Loader::get()->isModLoaded("syzzi.click_between_frames")) {
         say("Click Between Frames detected: mid-tick sync {}", buf.cbfSync ? "on" : "off");
     }
     if (Loader::get()->isModLoaded("square3ang.cbfextrapolate")) {
         say("CBF Extrapolate detected: visual only, predictions unaffected");
     }
-    say("v2.87 loaded. The stage key cycles: 0.5f -> 1f -> 2f -> 4f -> 6f -> 8f -> custom -> off");
+    say("v2.86 loaded. The stage key cycles: 0.5f -> 1f -> 2f -> 4f -> 6f -> 8f -> custom -> off");
 }
 
 class $modify(BufPlayLayer, PlayLayer) {
@@ -4119,111 +4038,8 @@ class $modify(BufPlayLayer, PlayLayer) {
         buf.ghost2 = makeGhost(this);
         buf.ghostLayerBase = buf.ghostLayer->getChildrenCount();
 
-        // In-game console (F9): hidden unless the player opens it.
-        constexpr float W = PANEL_W;
-        constexpr float H = PANEL_H;
         auto win = CCDirector::get()->getWinSize();
-        buf.panel = CCNode::create();
-        buf.panel->setPosition({ 8.f, win.height - H - 8.f });
-        buf.panel->setZOrder(1000);
-
-        // Background: the game's own blue background art, cropped to the panel and
-        // darkened from top to bottom so the text stays readable.
-        auto* stencil = CCLayerColor::create({ 255, 255, 255, 255 }, W, H);
-        auto* clip = CCClippingNode::create(stencil);
-        if (auto* art = CCSprite::create("game_bg_01_001.png")) {
-            auto size = art->getContentSize();
-            art->setScale(std::max(W / size.width, H / size.height));
-            art->setPosition({ W / 2.f, H / 2.f });
-            art->setColor({ 40, 120, 255 });
-            art->setOpacity(150);
-            clip->addChild(art);
-        }
-        auto* shade = CCLayerGradient::create({ 0, 0, 0, 50 }, { 0, 0, 0, 140 }, { 0.f, -1.f });
-        shade->setContentSize({ W, H });
-        clip->addChild(shade);
-        auto* header = CCLayerColor::create({ 0, 0, 0, 80 }, W, 28.f);
-        header->setPosition({ 0.f, H - 28.f });
-        clip->addChild(header);
-        auto* rule = CCLayerColor::create({ 255, 255, 255, 45 }, W - 16.f, 1.f);
-        rule->setPosition({ 8.f, H - 46.f });
-        clip->addChild(rule);
-        buf.panel->addChild(clip);
-
-        if (auto* frame = CCScale9Sprite::create("GJ_square07.png")) {
-            frame->setContentSize({ W, H });
-            frame->setPosition({ W / 2.f, H / 2.f });
-            frame->setOpacity(190);
-            buf.panel->addChild(frame);
-        }
-
-        auto* title = CCLabelBMFont::create("Click Before Frames", "goldFont.fnt");
-        title->setScale(0.55f);
-        title->setAnchorPoint({ 0.f, 0.5f });
-        title->setPosition({ 10.f, H - 14.f });
-        buf.panel->addChild(title);
-
-        auto* version = CCLabelBMFont::create(Mod::get()->getVersion().toVString().c_str(), "chatFont.fnt");
-        version->setScale(0.45f);
-        version->setOpacity(150);
-        version->setAnchorPoint({ 1.f, 0.5f });
-        version->setPosition({ W - 10.f, H - 14.f });
-        buf.panel->addChild(version);
-
-        buf.panelTitle = CCLabelBMFont::create("", "bigFont.fnt");
-        buf.panelTitle->setScale(0.4f);
-        buf.panelTitle->setAnchorPoint({ 0.f, 0.5f });
-        buf.panelTitle->setPosition({ 10.f, H - 37.f });
-        buf.panel->addChild(buf.panelTitle);
-
-        buf.panelLines.clear();
-        for (size_t i = 0; i < PANEL_LINES; ++i) {
-            auto* line = CCLabelBMFont::create("", "chatFont.fnt");
-            line->setScale(0.55f);
-            line->setAnchorPoint({ 0.f, 0.5f });
-            line->setPosition({ 10.f, H - 57.f - i * 13.f });
-            buf.panel->addChild(line);
-            buf.panelLines.push_back(line);
-        }
-
-        // v2.79: the hint shows the keys you set
-        auto* mod = Mod::get();
-        auto keyName = [mod](char const* key) {
-            auto binds = mod->getSettingValue<std::vector<Keybind>>(key);
-            return binds.empty() ? std::string("-") : binds.front().toString();
-        };
-        auto hintText = fmt::format("{} stage  {} menu  {} copy log  {} console  {} path  {} forget", keyName("bind-stage"),
-            keyName("bind-menu"), keyName("bind-export"), keyName("bind-console"), keyName("bind-path"), keyName("bind-forget"));
-        auto* hint = CCLabelBMFont::create(hintText.c_str(), "chatFont.fnt");
-        hint->setScale(0.45f);
-        hint->setColor({ 160, 190, 255 });
-        hint->setAnchorPoint({ 0.5f, 0.5f });
-        hint->setPosition({ W / 2.f, 9.f });
-        buf.panel->addChild(hint);
-
-        this->addChild(buf.panel);
-        refreshPanel();
-
-        buf.watermark = CCLabelBMFont::create("", "bigFont.fnt");
-        buf.watermark->setScale(0.28f);
-        buf.watermark->setColor({ 150, 205, 255 });
-        buf.watermark->setOpacity(153);
-        buf.watermark->setAnchorPoint({ 0.f, 0.f });
-        buf.watermark->setPosition({ 6.f, 4.f });
-        buf.watermark->setZOrder(1000);
-        this->addChild(buf.watermark);
         buf.usedThisAttempt = false;
-        refreshWatermark();
-
-        buf.autoTag = CCLabelBMFont::create("AUTO INPUTS ON", "bigFont.fnt");
-        buf.autoTag->setScale(0.24f);
-        buf.autoTag->setColor({ 255, 120, 120 });
-        buf.autoTag->setOpacity(153);  // 60%, like the console; still readable in a recording
-        buf.autoTag->setAnchorPoint({ 1.f, 0.f });
-        buf.autoTag->setPosition({ win.width - 6.f, 4.f });
-        buf.autoTag->setZOrder(1000);
-        this->addChild(buf.autoTag);
-        refreshAutoTag();
 
         buf.hintLabel = CCLabelBMFont::create("", "bigFont.fnt");
         buf.hintLabel->setColor({ 255, 170, 215 });
@@ -4231,6 +4047,22 @@ class $modify(BufPlayLayer, PlayLayer) {
         buf.hintLabel->setPosition({ win.width / 2.f, win.height - 40.f });
         buf.hintLabel->setZOrder(1000);
         this->addChild(buf.hintLabel);
+
+        buf.autoTagLabel = CCLabelBMFont::create("AUTO INPUTS ON", "bigFont.fnt");
+        buf.autoTagLabel->setColor({ 255, 170, 60 });
+        buf.autoTagLabel->setOpacity(170);
+        buf.autoTagLabel->setScale(0.35f);
+        buf.autoTagLabel->setPosition({ win.width / 2.f, win.height - 12.f });
+        buf.autoTagLabel->setZOrder(1000);
+        this->addChild(buf.autoTagLabel);
+        buf.tpsLabel = CCLabelBMFont::create("TPS", "bigFont.fnt");
+        buf.tpsLabel->setOpacity(150);
+        buf.tpsLabel->setScale(0.3f);
+        buf.tpsLabel->setAnchorPoint({ 1.f, 0.f });
+        buf.tpsLabel->setPosition({ win.width - 6.f, 6.f });
+        buf.tpsLabel->setZOrder(1000);
+        this->addChild(buf.tpsLabel);
+        refreshOverlays();
 
         buf.heatNode = nullptr;
         if (m_progressBar) {
@@ -4265,6 +4097,8 @@ class $modify(BufPlayLayer, PlayLayer) {
         saveProfile();
         restoreGlobals();
         buf.hintLabel = nullptr;
+        buf.autoTagLabel = nullptr;
+        buf.tpsLabel = nullptr;
         buf.heatNode = nullptr;
         memoryKey.clear();
         dropGhosts();
@@ -4289,7 +4123,6 @@ class $modify(BufPlayLayer, PlayLayer) {
         }
         resetPending();
         forgetPress();
-        refreshAutoTag();
         if (buf.pathNode) {
             buf.pathNode->clear();
         }
@@ -4303,12 +4136,6 @@ class $modify(BufPlayLayer, PlayLayer) {
         // pressed for you as the attempt started (the cube jumped by itself until you clicked).
         // Now the mod only presses when you press.
         syncHeld(this);
-    }
-
-    void togglePracticeMode(bool practiceMode) {
-        PlayLayer::togglePracticeMode(practiceMode);
-        refreshWatermark();
-        refreshAutoTag();
     }
 
     void playEndAnimationToPos(CCPoint position) {
@@ -4444,10 +4271,6 @@ class $modify(BufPlayerObject, PlayerObject) {
             ++logClock;
             if (buf.enabled) {
                 buf.usedThisAttempt = true;
-            }
-            if (buf.panelDirty) {
-                buf.panelDirty = false;
-                refreshPanel();
             }
             if (benchNeedStart) {
                 benchNeedStart = false;
@@ -4611,133 +4434,246 @@ class $modify(BufPlayerObject, PlayerObject) {
     }
 };
 
-// v2.81: Geode keybinds (mod settings or Geode's keybinds popup; work without F keys too).
-// Only act inside a level.
+// ---------- game-thread side of the external console ----------
+// Commands arrive from the pipe / hotkey threads already validated; they are applied here, on the
+// game thread, from the CCScheduler hook below (never from the pipe thread).
 namespace {
-    void keyAction(int action) {
+    std::string stripTags(std::string s) {
+        std::string o;
+        bool in = false;
+        for (char c : s) {
+            if (c == '<') { in = true; continue; }
+            if (c == '>' && in) { in = false; continue; }
+            if (!in) { o += c; }
+        }
+        return o;
+    }
+
+    // One call after any settings change: re-read everything and refresh what is drawn.
+    void onConfigChanged() {
+        readSettings();
+        applyStage();
+        buf.showPath = cfg::b("show-path");
+        if (!buf.showPath && buf.pathNode) {
+            buf.pathNode->clear();
+        }
+        refreshHeatmap();
+        refreshOverlays();
+    }
+
+    void sendConfig() {
+        PipeServer::get().send(cfg::config().dump());
+    }
+
+    std::string buildState() {
         auto* layer = GameManager::get()->m_playLayer;
-        if (!layer) {
-            return;
+        auto const& st = sessionStats;
+        float dt = buf.tickLength > 0.001f ? buf.tickLength : TICK;
+        std::string warn;
+        if (buf.tps != 240) {
+            warn += "TPS is not 240: runs are not legit. ";
         }
-        switch (action) {
-            case 0:
-                cycleStage();
-                break;
-            case 1:
-                if (!layer->m_isPaused) {
-                    layer->pauseGame(true);
-                }
-                BufferMenu::open();
-                break;
-            case 2:
-                exportConsole();
-                break;
-            case 3:
-                buf.panelOpen = !buf.panelOpen;
-                refreshPanel();
-                break;
-            case 4:
-                buf.showPath = !buf.showPath;
-                if (buf.pathNode) {
-                    buf.pathNode->clear();
-                }
-                say("path view {}", buf.showPath ? "on" : "off");
-                break;
-            case 5:
-                memory.clear();
-                pending.active = false;
-                memoryDirty = true;
-                saveMemory();
-                say("memory for this level cleared");
-                break;
+        if (layer && buf.enabled && !layer->m_isPracticeMode && !buf.practiceOnly) {
+            warn += "Buffer is active outside practice mode (not for verified runs). ";
+        }
+        std::string o = "{\"type\":\"state\"";
+        auto num = [&](char const* k, double v) { o += std::string(",\"") + k + "\":" + cfg::jnum(v); };
+        auto flag = [&](char const* k, bool v) { o += std::string(",\"") + k + "\":" + (v ? "true" : "false"); };
+        auto str = [&](char const* k, std::string const& v) { o += std::string(",\"") + k + "\":" + cfg::jstr(v); };
+        num("stage", buf.stage);
+        str("stageText", stageText());
+        flag("enabled", buf.enabled);
+        num("ticksAll", buf.ticksAll);
+        num("ticksWave", buf.ticksWave);
+        num("tps", buf.tps);
+        num("physicsPerSec", 60.0 / dt);
+        flag("inLevel", layer != nullptr);
+        str("level", layer && layer->m_level ? std::string(layer->m_level->m_levelName) : std::string());
+        flag("practice", layer && layer->m_isPracticeMode);
+        num("memorySpots", static_cast<double>(memorySpots()));
+        flag("lowLatency", buf.lowLatency);
+        flag("training", buf.train);
+        num("budgetMs", buf.budgetMs);
+        num("sessionSaves", static_cast<double>(st.saves));
+        num("sessionAttempts", static_cast<double>(st.attempts));
+        num("attemptSaves", static_cast<double>(attemptStats.saves));
+        num("avgEarlyTicks", st.saves > 0 ? static_cast<double>(st.earlySum) / st.saves : 0.0);
+        str("lastDecision", g_lastDecision);
+        str("lastCheck", lastBench);
+        str("warnings", warn);
+        return o + "}";
+    }
+
+    void sendHello() {
+        auto& p = PipeServer::get();
+        p.send("{\"type\":\"hello\",\"mod\":\"basu.input-buffer\",\"name\":\"Testing\",\"version\":" +
+            cfg::jstr(Mod::get()->getVersion().toVString()) + ",\"protocol\":1,\"note\":" + cfg::jstr(cfg::config().loadNote()) + "}");
+        p.send(cfg::config().schema());
+        sendConfig();
+        p.send(buildState());
+    }
+
+    // The presets the old Buffer menu had.
+    void applyPreset(std::string const& name) {
+        bool aggressive = name == "aggressive";
+        bool safe = name == "safe";
+        auto& c = cfg::config();
+        (void)c.set("robust-saves", cfg::Val::boolean(true));
+        (void)c.set("low-latency", cfg::Val::boolean(false));
+        (void)c.set("wave-safety-margin", cfg::Val::boolean(!aggressive));
+        (void)c.set("more-time-death-spots", cfg::Val::boolean(!safe));
+        setStage(safe ? 2 : aggressive ? 5 : 3);  // resetPending, applyStage, readSettings
+        onConfigChanged();
+        say("preset {}: {}", name, stageText());
+    }
+
+    void runAction(std::string const& name) {
+        if (name == "stage") {
+            cycleStage(1);
+        }
+        else if (name == "stage-back") {
+            cycleStage(-1);
+        }
+        else if (name == "export") {
+            exportConsole();
+        }
+        else if (name == "run-check") {
+            benchPending = true;  // starts on the next attempt from the beginning
+            say("run check: will start on the next attempt from the beginning");
+        }
+        else if (name == "stats") {
+            std::string text = stripTags(statsText());
+            std::stringstream ss(text);
+            for (std::string line; std::getline(ss, line);) {
+                say("stats: {}", line);
+            }
+        }
+        else if (name == "path") {
+            (void)cfg::config().set("show-path", cfg::Val::boolean(!buf.showPath));
+            onConfigChanged();
+            say("path view {}", buf.showPath ? "on" : "off");
+        }
+        else if (name == "forget") {
+            if (!GameManager::get()->m_playLayer) {
+                say("forget: open a level first");
+                return;
+            }
+            memory.clear();
+            pending.active = false;
+            memoryDirty = true;
+            saveMemory();
+            say("memory for this level cleared");
+        }
+        else if (name.rfind("preset-", 0) == 0) {
+            applyPreset(name.substr(7));
+        }
+        else if (name.rfind("toggle:", 0) == 0) {
+            std::string key = name.substr(7);
+            bool now = !cfg::config().b(key);
+            if (cfg::config().set(key, cfg::Val::boolean(now)).empty()) {
+                onConfigChanged();
+                say("{} {}", key, now ? "on" : "off");
+            }
+        }
+        sendConfig();
+    }
+
+    void handleCmd(Cmd const& c) {
+        auto& p = PipeServer::get();
+        auto ack = [&](std::string const& err) {
+            std::string o = "{\"type\":\"ack\",\"cmd\":" + cfg::jstr(c.kind) + ",\"ok\":" + (err.empty() ? "true" : "false");
+            if (!c.key.empty()) {
+                o += ",\"key\":" + cfg::jstr(c.key);
+            }
+            if (!err.empty()) {
+                o += ",\"error\":" + cfg::jstr(err);
+            }
+            if (!c.id.empty()) {
+                o += ",\"id\":" + c.id;
+            }
+            p.send(o + "}");
+        };
+        if (c.kind == "hello") {
+            sendHello();
+        }
+        else if (c.kind == "get_config") {
+            sendConfig();
+        }
+        else if (c.kind == "set") {
+            std::string err = cfg::config().set(c.key, c.value);
+            if (err.empty()) {
+                onConfigChanged();
+                say("setting {} = {}", c.key, cfg::jval(c.value));
+                sendConfig();
+            }
+            ack(err);
+        }
+        else if (c.kind == "stage") {
+            setStage(static_cast<int>(c.value.n));
+            ack("");
+        }
+        else if (c.kind == "preset") {
+            applyPreset(c.name);
+            sendConfig();
+            ack("");
+        }
+        else if (c.kind == "action") {
+            runAction(c.name);
+            ack("");
+        }
+        else if (c.kind == "reset") {
+            cfg::config().reset(c.name);
+            onConfigChanged();
+            say("settings reset ({})", c.name);
+            sendConfig();
+            ack("");
         }
     }
 
-    void setupKeybinds() {
-        char const* binds[] = { "bind-stage", "bind-menu", "bind-export", "bind-console", "bind-path", "bind-forget" };
-        for (int i = 0; i < 6; ++i) {
-            listenForKeybindSettingPresses(binds[i], [i](Keybind const&, bool down, bool repeat, double) {
-                if (down && !repeat) {
-                    keyAction(i);
+    // Called every frame from the scheduler: two atomic reads when nobody is connected.
+    void pumpPipe(float dt) {
+        auto& p = PipeServer::get();
+        try {
+            if (p.takeHello()) {
+                sendHello();
+            }
+            if (p.hasCommands()) {
+                Cmd c;
+                for (int n = 0; n < 32 && p.pop(c); ++n) {
+                    handleCmd(c);
                 }
-                return false;
-            });
-        }
-    }
-
-    // v2.81 update check: once per game start, reads the version in the public repo's mod.json
-    // (in the background) and says so on the main menu if a newer one is out.
-    constexpr char const* REPO_URL = "https://github.com/raresdalas1009/-predictive-input-buffer";
-    std::string latestVersion;
-    bool updateChecked = false;
-    bool updateShown = false;
-
-    void showUpdatePopup() {
-        if (updateShown || latestVersion.empty() || !CCScene::get()) {
-            return;
-        }
-        updateShown = true;
-        say("update: {} is out (you have {})", latestVersion, Mod::get()->getVersion().toVString());
-        createQuickPopup("Click Before Frames", fmt::format("<cp>{}</c> is out! You have {}.", latestVersion,
-            Mod::get()->getVersion().toVString()), "Later", "Open page", [](FLAlertLayer*, bool open) {
-                if (open) {
-                    web::openLinkInBrowser(std::string(REPO_URL));
+            }
+            static float acc = 0.f;
+            acc += dt;
+            if (acc >= 0.25f) {
+                acc = 0.f;
+                if (p.connected()) {
+                    p.send(buildState());
                 }
-            });
-    }
-
-    void checkForUpdate() {
-        if (updateChecked || !Mod::get()->getSettingValue<bool>("check-updates")) {
-            return;
+            }
         }
-        updateChecked = true;
-        std::thread([] {
-            auto res = web::WebRequest()
-                .timeout(std::chrono::seconds(10))
-                .getSync("https://raw.githubusercontent.com/raresdalas1009/-predictive-input-buffer/main/mod.json");
-            if (!res.ok()) {
-                return;
-            }
-            auto json = res.json();
-            if (json.isErr()) {
-                return;
-            }
-            auto version = json.unwrap()["version"].asString();
-            if (version.isErr()) {
-                return;
-            }
-            auto latest = VersionInfo::parse(version.unwrap());
-            if (latest.isErr() || !(latest.unwrap() > Mod::get()->getVersion())) {
-                return;
-            }
-            std::string name = latest.unwrap().toVString();
-            queueInMainThread([name] {
-                latestVersion = name;
-                auto* scene = CCScene::get();
-                if (scene && scene->getChildByID("MenuLayer")) {
-                    showUpdatePopup();
-                }
-            });
-        }).detach();
+        catch (...) {
+        }
     }
 }
 
-$on_mod(Loaded) {
-    setupKeybinds();
-}
-
-class $modify(BufMenuLayer, MenuLayer) {
-    bool init() {
-        if (!MenuLayer::init()) {
-            return false;
-        }
-        checkForUpdate();
-        if (!latestVersion.empty() && !updateShown) {
-            queueInMainThread([] { showUpdatePopup(); });
-        }
-        return true;
+class $modify(BufScheduler, CCScheduler) {
+    void update(float dt) {
+        pumpPipe(dt);
+        CCScheduler::update(dt);
     }
 };
+
+$on_mod(Loaded) {
+    std::string keys;
+    for (auto const& sp : cfg::specs()) {
+        if (cfg::isBind(sp.key) && !cfg::s(sp.key.c_str()).empty()) {
+            keys += (keys.empty() ? "" : " | ") + cfg::s(sp.key.c_str()) + " " + sp.key.substr(5);
+        }
+    }
+    say("keys (while Geometry Dash is focused): {}", keys);
+    say("settings file: {}", (Mod::get()->getSaveDir() / "config.json").string());
+}
 
 // v2.79 custom TPS (from the v2.80 build): above 240 the level is stepped in 1/tps pieces.
 // update() runs once per step and getModifiedDelta() hands the step through unrounded, so
