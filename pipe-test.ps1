@@ -2,7 +2,7 @@
 #   .\pipe-test.ps1                      connect, run a short self-test, print every reply
 #   .\pipe-test.ps1 -Watch               connect and just print what the mod sends (Ctrl+C to stop)
 #   .\pipe-test.ps1 -Send '{"cmd":"action","name":"toggle:low-latency"}'
-param([switch]$Watch, [string]$Send = "", [string]$Name = "basu-input-buffer-testing")
+param([switch]$Watch, [string]$Send = "", [string]$Name = "abhyu-input-buffer-testing")
 
 $pipe = New-Object System.IO.Pipes.NamedPipeClientStream(".", $Name, [System.IO.Pipes.PipeDirection]::InOut)
 try { $pipe.Connect(3000) } catch { Write-Host "Could not connect: is Geometry Dash running with the mod loaded?"; exit 1 }

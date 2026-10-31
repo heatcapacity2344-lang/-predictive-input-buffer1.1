@@ -18,6 +18,12 @@
 
 namespace cfg {
 
+    // Limits shared with main.cpp (which static_asserts them against its STAGES table).
+    constexpr int CONFIG_VERSION = 2;      // 1 = before the rename (no "stage" / "config-version" keys)
+    constexpr int STAGE_MAX = 10;          // stages 0..5 presets, 6..9 custom slots A-D, 10 = off
+    constexpr int CUSTOM_MAX_TICKS = 128;  // 32 frames at 60 fps
+    constexpr int CUSTOM_MAX_WAVE_TICKS = 64;
+
     // ---------- tiny flat-JSON reader / writer ----------
     struct Val {
         enum T { None, Bool, Num, Str } t = None;
@@ -245,6 +251,12 @@ namespace cfg {
             {"preset-safe", "Ctrl+F1", "Preset Safe (stage 2)"},
             {"preset-balanced", "Ctrl+F2", "Preset Balanced (stage 3)"},
             {"preset-aggressive", "Ctrl+F3", "Preset Aggressive (stage 5)"},
+            {"custom-down", "Ctrl+F11", "Custom slot: 1 frame (4 ticks) less delay, also for wave. Only while a custom slot is the current stage"},
+            {"custom-up", "Ctrl+F12", "Custom slot: 1 frame (4 ticks) more delay, also for wave. Only while a custom slot is the current stage"},
+            {"slot-a", "Alt+1", "Switch to custom slot A"},
+            {"slot-b", "Alt+2", "Switch to custom slot B"},
+            {"slot-c", "Alt+3", "Switch to custom slot C"},
+            {"slot-d", "Alt+4", "Switch to custom slot D"},
         };
         return a;
     }
@@ -254,14 +266,33 @@ namespace cfg {
         if (setting == "training-mode") return "F9";
         if (setting == "wave-auto-release") return "Shift+F9";
         if (setting == "practice-only") return "Shift+F10";
+        if (setting == "death-heatmap") return "Shift+F11";
+        if (setting == "save-ding") return "Shift+F12";
+        if (setting == "show-hint-text") return "Ctrl+F6";
+        if (setting == "show-auto-tag") return "Ctrl+F7";
+        if (setting == "show-tps-text") return "Ctrl+F8";
+        if (setting == "show-watermark") return "Ctrl+F9";
+        if (setting == "show-complete-label") return "Ctrl+F10";
         return "";
     }
 
     inline const std::vector<Spec>& specs() {
         static const std::vector<Spec> all = [] {
             std::vector<Spec> v = {
-        {"custom-ticks", Kind::Int, 40, 1, 64, "", R"~(Custom stage: max delay (ticks): Max delay for the CUSTOM F6 stage, all modes except wave. 4 ticks = 1 frame at 60fps.)~"},
-        {"custom-wave-ticks", Kind::Int, 20, 0, 64, "", R"~(Custom stage: max wave delay (ticks): Max delay for the CUSTOM F6 stage while in wave.)~"},
+        {"config-version", Kind::Int, 2, 1, 999, "", R"~(Config file version (internal): Used to upgrade this file when settings change between versions. Don't edit it.)~"},
+        {"stage", Kind::Int, 0, 0, 10, "", R"~(Buffer stage: 0 = 0.5f, 1 = 1f, 2 = 2f, 3 = 4f/2f wave, 4 = 6f/3f wave, 5 = 8f/4f wave, 6-9 = custom slots A-D, 10 = off. Same for every level; the stage key (F6) changes it and it is remembered between sessions.)~"},
+        {"custom-ticks", Kind::Int, 40, 1, 128, "", R"~(Custom slot A: max delay (ticks): Max delay for custom slot A in every mode except wave and ship. 4 ticks = 1 frame at 60fps, so 128 = 32 frames. Applies immediately, also while playing.)~"},
+        {"custom-wave-ticks", Kind::Int, 20, 0, 64, "", R"~(Custom slot A: max wave delay (ticks): Max delay for custom slot A while in wave. 0 = wave inputs are never delayed in this slot.)~"},
+        {"custom-name", Kind::Str, 0, 0, 0, "Custom A", R"~(Custom slot A: name: Shown in the log and the in-game text (up to 24 letters, digits and basic symbols).)~"},
+        {"custom-b-ticks", Kind::Int, 12, 1, 128, "", R"~(Custom slot B: max delay (ticks): Max delay for custom slot B in every mode except wave and ship. 4 ticks = 1 frame.)~"},
+        {"custom-b-wave-ticks", Kind::Int, 8, 0, 64, "", R"~(Custom slot B: max wave delay (ticks): Max delay for custom slot B while in wave.)~"},
+        {"custom-b-name", Kind::Str, 0, 0, 0, "Custom B", R"~(Custom slot B: name: Shown in the log and the in-game text.)~"},
+        {"custom-c-ticks", Kind::Int, 20, 1, 128, "", R"~(Custom slot C: max delay (ticks): Max delay for custom slot C in every mode except wave and ship. 4 ticks = 1 frame.)~"},
+        {"custom-c-wave-ticks", Kind::Int, 10, 0, 64, "", R"~(Custom slot C: max wave delay (ticks): Max delay for custom slot C while in wave.)~"},
+        {"custom-c-name", Kind::Str, 0, 0, 0, "Custom C", R"~(Custom slot C: name: Shown in the log and the in-game text.)~"},
+        {"custom-d-ticks", Kind::Int, 64, 1, 128, "", R"~(Custom slot D: max delay (ticks): Max delay for custom slot D in every mode except wave and ship. 4 ticks = 1 frame.)~"},
+        {"custom-d-wave-ticks", Kind::Int, 32, 0, 64, "", R"~(Custom slot D: max wave delay (ticks): Max delay for custom slot D while in wave.)~"},
+        {"custom-d-name", Kind::Str, 0, 0, 0, "Custom D", R"~(Custom slot D: name: Shown in the log and the in-game text.)~"},
         {"sim-budget-ms", Kind::Float, 8.0, 1.0, 30.0, "", R"~(Prediction time budget (ms): Max time spent predicting per click. Higher = finds longer saves on big windows, but may hitch on dense levels.)~"},
         {"smart-prediction", Kind::Bool, 1, 0, 0, "", R"~(Orb / pad / portal prediction: Let the ghost use orbs, pads, gravity portals and speed portals. Turn off if you see glitches with objects.)~"},
         {"ground-horizon", Kind::Int, 130, 48, 240, "", R"~(Cube / ball lookahead (ticks): How far ahead the prediction looks for cube, ball and spider. A cube jump lasts about 100 ticks, so the old 48 never saw the landing. Higher = catches later hits but costs more time per click.)~"},
@@ -317,6 +348,8 @@ namespace cfg {
         {"show-hint-text", Kind::Bool, 0, 0, 0, "", R"~(Training hint text (in-game text, off by default). Shows "click 2f early" at the top of the screen in training mode.)~"},
         {"show-auto-tag", Kind::Bool, 0, 0, 0, "", R"~(AUTO INPUTS ON tag (in-game text, off by default). Small label while any auto-release or auto-click option is on.)~"},
         {"show-tps-text", Kind::Bool, 0, 0, 0, "", R"~(TPS text (in-game text, off by default). Small label with the physics TPS (anything but 240 is not a legit run).)~"},
+        {"show-watermark", Kind::Bool, 0, 0, 0, "", R"~(Watermark (in-game text, off by default). Small "Testing | stage" label in the corner of the level while the buffer is on.)~"},
+        {"show-complete-label", Kind::Bool, 0, 0, 0, "", R"~(Level complete label (in-game text, off by default). Shows "Testing was on" and the attempt's save summary on the level complete screen if the buffer was on during the attempt.)~"},
             };
             std::vector<Spec> out(v.begin(), v.end());
             for (auto const& a : actions()) {
@@ -360,6 +393,7 @@ namespace cfg {
                 if (!ok) defaults();
                 m_loadNote = ok ? "config.json was unreadable, restored the last valid copy" : "no valid config found, defaults used";
             }
+            m_vals["config-version"] = Val::number(CONFIG_VERSION);
             saveLocked();
             m_ready = true;
         }
@@ -448,6 +482,17 @@ namespace cfg {
                 }
                 case Kind::Str: {
                     if (v.t != Val::Str) return "'" + key + "' needs text";
+                    if (!isBind(key)) {  // free text: custom slot names (plain ASCII, up to 24 characters)
+                        std::string clean;
+                        for (unsigned char ch : v.s) {
+                            if (ch >= 0x20 && ch <= 0x7E && clean.size() < 24) clean += static_cast<char>(ch);
+                        }
+                        while (!clean.empty() && clean.back() == ' ') clean.pop_back();
+                        while (!clean.empty() && clean.front() == ' ') clean.erase(0, 1);
+                        if (clean.empty()) return "'" + key + "' needs a name (letters, digits, basic symbols)";
+                        v.s = clean;
+                        return "";
+                    }
                     if (v.s.empty()) return "";  // unbound
                     int vk = 0, mods = 0;
                     if (!parseKey(v.s, vk, mods)) return "'" + v.s + "' is not a valid key (examples: F8, Shift+F6, Ctrl+F1)";
@@ -468,6 +513,19 @@ namespace cfg {
             ss << in.rdbuf();
             Obj o;
             if (!parseFlat(ss.str(), o)) return false;
+            int fileVersion = 1;  // files from before the version key existed
+            {
+                auto vit = o.find("config-version");
+                if (vit != o.end() && vit->second.t == Val::Num && vit->second.n >= 1 && vit->second.n <= 999) fileVersion = static_cast<int>(vit->second.n);
+            }
+            if (makeBackup && fileVersion != CONFIG_VERSION) {
+                // keep a copy of a file from another version before it is rewritten
+                std::error_code ec2;
+                std::filesystem::copy_file(p, m_dir / ("config.v" + std::to_string(fileVersion) + ".json"), std::filesystem::copy_options::overwrite_existing, ec2);
+                m_loadNote = fileVersion > CONFIG_VERSION
+                    ? "config.json is from a newer version (settings this version doesn't know were ignored; a copy was kept)"
+                    : "config.json was upgraded from an older version (a copy was kept)";
+            }
             for (auto const& sp : specs()) {
                 auto it = o.find(sp.key);
                 if (it == o.end()) continue;

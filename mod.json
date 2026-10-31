@@ -3,13 +3,10 @@
 	"gd": {
 		"win": "2.2081"
 	},
-	"version": "v2.86.0",
-	"id": "basu.input-buffer",
+	"version": "v2.87.0",
+	"id": "abhyu.input-buffer",
 	"name": "Testing",
-	"developer": "BASU",
+	"developer": "abhyu",
 	"description": "Practice-only testing tool. Runs in the background; controlled from an external console.",
-	"settings": {},
-	"links": {
-		"source": "https://github.com/raresdalas1009/-predictive-input-buffer"
-	}
+	"settings": {}
 }

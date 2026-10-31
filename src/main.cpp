@@ -1,4 +1,4 @@
-// Testing (id basu.input-buffer) v2.9: Click Before Frames engine, no in-game UI. All settings live in config.json (cfg.hpp) and are driven from an external console over a named pipe.
+// Testing (id abhyu.input-buffer) v2.87: Click Before Frames engine, no in-game UI. All settings live in config.json (cfg.hpp) and are driven from an external console over a named pipe.
 //
 // When you click (or release, in wave / robot), a hidden "ghost" player is simulated
 // ahead with your input. If the ghost dies, the input is retried with 1..N ticks of
@@ -6,7 +6,7 @@
 // and delivered that many physics ticks later. 1 tick = 1/240 s = 0.25 frames @ 60fps.
 //
 // v2 changes:
-//  - Bigger windows: F6 stages up to 32 ticks (8 frames) plus a CUSTOM stage (settings).
+//  - Bigger windows: F6 stages up to 32 ticks (8 frames) plus four named CUSTOM slots A-D (settings, up to 128 ticks).
 //  - Smart prediction: ghost uses orbs, pads, gravity portals and speed portals; mode /
 //    size / dual / mirror / teleport portals end the prediction as "safe".
 //  - Input queue: every input arriving during a delay is shifted by the same amount,
@@ -40,6 +40,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <cctype>
 #include <climits>
@@ -124,19 +125,29 @@ namespace {
         int ticksAll;
         int ticksWave;
         bool custom;
+        int slot;  // custom slot 0..3 (A-D), -1 for the fixed stages
     };
 
     constexpr Stage STAGES[] = {
-        { true, 2, 2, false },
-        { true, 4, 4, false },
-        { true, 8, 8, false },
-        { true, 16, 8, false },
-        { true, 24, 12, false },
-        { true, 32, 16, false },
-        { true, 0, 0, true },
-        { false, 0, 0, false },
+        { true, 2, 2, false, -1 },
+        { true, 4, 4, false, -1 },
+        { true, 8, 8, false, -1 },
+        { true, 16, 8, false, -1 },
+        { true, 24, 12, false, -1 },
+        { true, 32, 16, false, -1 },
+        { true, 0, 0, true, 0 },   // 6: custom slot A (keys custom-ticks / custom-wave-ticks, as before)
+        { true, 0, 0, true, 1 },   // 7: custom slot B
+        { true, 0, 0, true, 2 },   // 8: custom slot C
+        { true, 0, 0, true, 3 },   // 9: custom slot D
+        { false, 0, 0, false, -1 },  // 10: off
     };
     constexpr int STAGE_COUNT = sizeof(STAGES) / sizeof(STAGES[0]);
+    static_assert(STAGE_COUNT - 1 == cfg::STAGE_MAX, "STAGES table and cfg::STAGE_MAX must agree");
+    constexpr int FIRST_CUSTOM_STAGE = 6;
+    constexpr int CUSTOM_SLOTS = 4;
+    constexpr char const* CUSTOM_TICKS_KEY[CUSTOM_SLOTS] = { "custom-ticks", "custom-b-ticks", "custom-c-ticks", "custom-d-ticks" };
+    constexpr char const* CUSTOM_WAVE_KEY[CUSTOM_SLOTS] = { "custom-wave-ticks", "custom-b-wave-ticks", "custom-c-wave-ticks", "custom-d-wave-ticks" };
+    constexpr char const* CUSTOM_NAME_KEY[CUSTOM_SLOTS] = { "custom-name", "custom-b-name", "custom-c-name", "custom-d-name" };
 
     struct QueuedInput {
         int ticksLeft;
@@ -270,6 +281,9 @@ namespace {
         bool showTpsText = false;    // console toggle: TPS text (off by default)
         CCLabelBMFont* autoTagLabel = nullptr;
         CCLabelBMFont* tpsLabel = nullptr;
+        bool showWatermark = false;  // console toggle: "Testing | stage" label (off by default)
+        bool showComplete = false;   // console toggle: "Testing was on" on the level complete screen (off by default)
+        CCLabelBMFont* watermarkLabel = nullptr;
         CCDrawNode* heatNode = nullptr;      // v2.51: death marks on the progress bar
         bool ufoSmart = true;        // v2.40: UFO landing + "could you have flapped again" scoring
         bool spiderSmart = true;     // v2.15: spider-aware landing + "could you have flipped back" scoring
@@ -588,7 +602,7 @@ namespace {
     private:
 #ifdef GEODE_IS_WINDOWS
         void pipeLoop() {
-            HANDLE h = CreateNamedPipeA("\\\\.\\pipe\\basu-input-buffer-testing", PIPE_ACCESS_DUPLEX,
+            HANDLE h = CreateNamedPipeA("\\\\.\\pipe\\abhyu-input-buffer-testing", PIPE_ACCESS_DUPLEX,
                 PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_NOWAIT | PIPE_REJECT_REMOTE_CLIENTS, 1, 1 << 16, 1 << 16, 0, nullptr);
             if (h == INVALID_HANDLE_VALUE) {
                 return;
@@ -800,6 +814,8 @@ namespace {
         buf.showHint = cfg::b("show-hint-text");
         buf.showAutoTag = cfg::b("show-auto-tag");
         buf.showTpsText = cfg::b("show-tps-text");
+        buf.showWatermark = cfg::b("show-watermark");
+        buf.showComplete = cfg::b("show-complete-label");
         buf.moreTime = cfg::b("more-time-death-spots");
         buf.dashAutoRelease = cfg::b("dash-auto-release");
         buf.perfLog = cfg::b("perf-log");
@@ -868,11 +884,13 @@ namespace {
     }
 
     void applyStage() {
+        buf.stage = std::clamp(buf.stage, 0, STAGE_COUNT - 1);
         auto const& s = STAGES[buf.stage];
         buf.enabled = s.enabled;
         if (s.custom) {
-            buf.ticksAll = static_cast<int>(cfg::i("custom-ticks"));
-            buf.ticksWave = static_cast<int>(cfg::i("custom-wave-ticks"));
+            // v2.87: four custom slots; read live, so a change from the console applies at once
+            buf.ticksAll = std::clamp(static_cast<int>(cfg::i(CUSTOM_TICKS_KEY[s.slot])), 1, cfg::CUSTOM_MAX_TICKS);
+            buf.ticksWave = std::clamp(static_cast<int>(cfg::i(CUSTOM_WAVE_KEY[s.slot])), 0, cfg::CUSTOM_MAX_WAVE_TICKS);
         }
         else {
             buf.ticksAll = s.ticksAll;
@@ -931,7 +949,9 @@ namespace {
         if (!buf.enabled) {
             return "Buffer: OFF";
         }
-        return fmt::format("Buffer{}: {:g}f / wave {:g}f{}", STAGES[buf.stage].custom ? " (custom)" : "", buf.ticksAll * TICK,
+        auto const& cs = STAGES[std::clamp(buf.stage, 0, STAGE_COUNT - 1)];
+        std::string tag = cs.custom ? " (" + cfg::s(CUSTOM_NAME_KEY[cs.slot]) + ")" : std::string();
+        return fmt::format("Buffer{}: {:g}f / wave {:g}f{}", tag, buf.ticksAll * TICK,
             buf.ticksWave * TICK, buf.train ? " [training]" : "");
     }
 
@@ -3143,6 +3163,11 @@ namespace {
             buf.tpsLabel->setString(fmt::format("TPS {}", buf.tps).c_str());
             buf.tpsLabel->setVisible(buf.showTpsText);
         }
+        if (buf.watermarkLabel) {
+            std::string tps = buf.tps != 240 ? fmt::format("  |  {} TPS", buf.tps) : std::string();
+            buf.watermarkLabel->setString(fmt::format("Testing  |  {}{}", stageText(), tps).c_str());
+            buf.watermarkLabel->setVisible(buf.showWatermark && buf.enabled);
+        }
     }
 
     // v2.51 stats popup text
@@ -3707,9 +3732,10 @@ namespace {
     }
 
     void setStage(int stage) {
-        buf.stage = stage;
-        // v2.59: the stage is one setting for every level and survives restarts
-        Mod::get()->setSavedValue("stage", buf.stage);
+        buf.stage = std::clamp(stage, 0, STAGE_COUNT - 1);
+        // v2.59: the stage is one setting for every level and survives restarts.
+        // v2.87: it lives in config.json now (key "stage").
+        (void)cfg::config().set("stage", cfg::Val::number(buf.stage));
         resetPending();
         // A delayed input that was waiting is dropped; the game gets what you're really
         // holding now (otherwise, with the buffer switched off, it never would).
@@ -3719,6 +3745,7 @@ namespace {
         }
         applyStage();
         readSettings();
+        refreshOverlays();
         saveProfile();
         say("stage -> {}", stageText());
     }
@@ -3900,17 +3927,129 @@ class $modify(BufEndLevelLayer, EndLevelLayer) {
         if (!buf.usedThisAttempt) {
             return;
         }
+        if (buf.showComplete) {
+            auto win = CCDirector::get()->getWinSize();
+            auto* label = CCLabelBMFont::create("Testing was on", "bigFont.fnt");
+            label->setScale(0.35f);
+            label->setColor({ 150, 205, 255 });
+            label->setOpacity(170);
+            label->setAnchorPoint({ 1.f, 1.f });
+            label->setPosition({ win.width - 6.f, win.height - 4.f });
+            this->addChild(label, 100);
+            if (attemptStats.saves > 0) {
+                auto* stats = CCLabelBMFont::create(attemptSummary().c_str(), "bigFont.fnt");
+                stats->setScale(0.28f);
+                stats->setColor({ 255, 190, 225 });
+                stats->setOpacity(170);
+                stats->setAnchorPoint({ 1.f, 1.f });
+                stats->setPosition({ win.width - 6.f, win.height - 16.f });
+                this->addChild(stats, 100);
+            }
+        }
         benchFinish();  // a completed run is the best recording there is
         benchFlush();
         endAttempt();
     }
 };
 
+// v2.87 (rename): one-time COPY of the data of the old mod folder into this one. Nothing in the old
+// folder is changed or deleted. Runs once (import-done.txt), before config.json is loaded.
+// Returns the old stage (mapped to the new numbering) or -1. This is the only place that
+// still names the old folder.
+namespace {
+    constexpr char const* OLD_SAVE_FOLDER = "basu.input-buffer";
+    std::string importNote;
+
+    int importOldData() {
+        namespace fs = std::filesystem;
+        std::error_code ec;
+        auto dir = Mod::get()->getSaveDir();
+        auto marker = dir / "import-done.txt";
+        if (fs::exists(marker, ec)) {
+            return -1;
+        }
+        auto old = dir.parent_path() / OLD_SAVE_FOLDER;
+        if (!fs::is_directory(old, ec)) {
+            return -1;
+        }
+        fs::create_directories(dir, ec);
+        int copied = 0;
+        for (char const* name : { "config.json", "run-check-results.txt" }) {
+            auto from = old / name;
+            if (fs::is_regular_file(from, ec)) {
+                std::error_code cec;
+                fs::copy_file(from, dir / name, fs::copy_options::skip_existing, cec);
+                copied += cec ? 0 : 1;
+            }
+        }
+        for (char const* name : { "memory", "bench" }) {
+            auto from = old / name;
+            if (fs::is_directory(from, ec)) {
+                std::error_code cec;
+                fs::copy(from, dir / name, fs::copy_options::skip_existing | fs::copy_options::recursive, cec);
+                copied += cec ? 0 : 1;
+            }
+        }
+        // saved.json: the old stage and the per-level profiles
+        int stage = -1;
+        int profiles = 0;
+        auto savedPath = old / "saved.json";
+        std::ifstream in(savedPath, std::ios::binary);
+        if (in) {
+            std::stringstream ss;
+            ss << in.rdbuf();
+            std::string text = ss.str();
+            auto sp = text.find("\"stage\"");
+            if (sp != std::string::npos) {
+                size_t i = sp + 7;
+                while (i < text.size() && (text[i] == ' ' || text[i] == ':' || text[i] == '\n' || text[i] == '\t')) {
+                    ++i;
+                }
+                if (i < text.size() && text[i] >= '0' && text[i] <= '9') {
+                    int old_stage = std::atoi(text.c_str() + i);
+                    stage = old_stage == 7 ? 10 : (old_stage >= 0 && old_stage <= 6 ? old_stage : -1);  // old numbering: 6 custom, 7 off
+                }
+            }
+            std::vector<std::string> keys;
+            for (size_t p = text.find("\"profile-"); p != std::string::npos; p = text.find("\"profile-", p + 1)) {
+                auto end = text.find('"', p + 1);
+                if (end == std::string::npos) {
+                    break;
+                }
+                auto key = text.substr(p + 1, end - p - 1);
+                if (key != "profile-globals" && std::find(keys.begin(), keys.end(), key) == keys.end()) {
+                    keys.push_back(key);
+                }
+            }
+            if (!keys.empty()) {
+                auto res = geode::utils::file::readJson(savedPath);
+                if (res.isOk()) {
+                    auto root = std::move(res).unwrap();
+                    for (auto const& key : keys) {
+                        if (root.contains(key.c_str())) {
+                            Mod::get()->setSavedValue(key, root[key.c_str()]);
+                            ++profiles;
+                        }
+                    }
+                }
+            }
+        }
+        std::ofstream(marker, std::ios::trunc) << "old data was copied once; delete this file to allow another import\n";
+        importNote = fmt::format("imported old data: {} item(s) copied, {} per-level profile(s), old stage {}", copied, profiles,
+            stage >= 0 ? std::to_string(stage) : std::string("none"));
+        return stage;
+    }
+}
+
 $on_mod(Loaded) {
+    int importedStage = importOldData();
     cfg::config().init(Mod::get()->getSaveDir());
+    if (importedStage >= 0) {
+        (void)cfg::config().set("stage", cfg::Val::number(importedStage));
+    }
     buf.showPath = cfg::b("show-path");
     recoverGlobals();
-    buf.stage = std::clamp(static_cast<int>(Mod::get()->getSavedValue<int64_t>("stage", 0)), 0, STAGE_COUNT - 1);
+    buf.stage = std::clamp(static_cast<int>(cfg::i("stage")), 0, STAGE_COUNT - 1);
     // v2.62: per-level settings off (switched off once): every level uses the same switches, like v2.43.1
     if (!Mod::get()->getSavedValue<bool>("per-level-v262", false)) {
         cfg::setTemp("per-level-settings", false);
@@ -3949,7 +4088,13 @@ $on_mod(Loaded) {
     if (Loader::get()->isModLoaded("square3ang.cbfextrapolate")) {
         say("CBF Extrapolate detected: visual only, predictions unaffected");
     }
-    say("v2.86 loaded. The stage key cycles: 0.5f -> 1f -> 2f -> 4f -> 6f -> 8f -> custom -> off");
+    say("v2.87 loaded. The stage key cycles: 0.5f -> 1f -> 2f -> 4f -> 6f -> 8f -> custom A-D -> off");
+    if (!importNote.empty()) {
+        say("{}", importNote);
+    }
+    if (!cfg::config().loadNote().empty()) {
+        say("config: {}", cfg::config().loadNote());
+    }
 }
 
 class $modify(BufPlayLayer, PlayLayer) {
@@ -4062,6 +4207,14 @@ class $modify(BufPlayLayer, PlayLayer) {
         buf.tpsLabel->setPosition({ win.width - 6.f, 6.f });
         buf.tpsLabel->setZOrder(1000);
         this->addChild(buf.tpsLabel);
+        buf.watermarkLabel = CCLabelBMFont::create("", "bigFont.fnt");
+        buf.watermarkLabel->setScale(0.28f);
+        buf.watermarkLabel->setColor({ 150, 205, 255 });
+        buf.watermarkLabel->setOpacity(153);
+        buf.watermarkLabel->setAnchorPoint({ 0.f, 0.f });
+        buf.watermarkLabel->setPosition({ 6.f, 4.f });
+        buf.watermarkLabel->setZOrder(1000);
+        this->addChild(buf.watermarkLabel);
         refreshOverlays();
 
         buf.heatNode = nullptr;
@@ -4099,6 +4252,7 @@ class $modify(BufPlayLayer, PlayLayer) {
         buf.hintLabel = nullptr;
         buf.autoTagLabel = nullptr;
         buf.tpsLabel = nullptr;
+        buf.watermarkLabel = nullptr;
         buf.heatNode = nullptr;
         memoryKey.clear();
         dropGhosts();
@@ -4451,6 +4605,11 @@ namespace {
 
     // One call after any settings change: re-read everything and refresh what is drawn.
     void onConfigChanged() {
+        // v2.87: the stage is a config key too ("set stage" from the console, "reset settings")
+        int wantStage = std::clamp(static_cast<int>(cfg::i("stage")), 0, STAGE_COUNT - 1);
+        if (wantStage != buf.stage) {
+            setStage(wantStage);
+        }
         readSettings();
         applyStage();
         buf.showPath = cfg::b("show-path");
@@ -4506,7 +4665,7 @@ namespace {
 
     void sendHello() {
         auto& p = PipeServer::get();
-        p.send("{\"type\":\"hello\",\"mod\":\"basu.input-buffer\",\"name\":\"Testing\",\"version\":" +
+        p.send("{\"type\":\"hello\",\"mod\":\"abhyu.input-buffer\",\"name\":\"Testing\",\"version\":" +
             cfg::jstr(Mod::get()->getVersion().toVString()) + ",\"protocol\":1,\"note\":" + cfg::jstr(cfg::config().loadNote()) + "}");
         p.send(cfg::config().schema());
         sendConfig();
@@ -4533,6 +4692,25 @@ namespace {
         }
         else if (name == "stage-back") {
             cycleStage(-1);
+        }
+        else if (name == "custom-up" || name == "custom-down") {
+            auto const& cs = STAGES[std::clamp(buf.stage, 0, STAGE_COUNT - 1)];
+            if (!cs.custom) {
+                say("custom up/down only works while a custom slot is the stage (now: {})", stageText());
+            }
+            else {
+                int dir = name == "custom-up" ? 1 : -1;
+                int all = std::clamp(static_cast<int>(cfg::i(CUSTOM_TICKS_KEY[cs.slot])) + dir * 4, 1, cfg::CUSTOM_MAX_TICKS);
+                int wave = std::clamp(static_cast<int>(cfg::i(CUSTOM_WAVE_KEY[cs.slot])) + dir * 4, 0, cfg::CUSTOM_MAX_WAVE_TICKS);
+                (void)cfg::config().set(CUSTOM_TICKS_KEY[cs.slot], cfg::Val::number(all));
+                (void)cfg::config().set(CUSTOM_WAVE_KEY[cs.slot], cfg::Val::number(wave));
+                onConfigChanged();
+                say("{}", stageText());
+            }
+        }
+        else if (name.size() == 6 && name.rfind("slot-", 0) == 0 && name[5] >= 'a' && name[5] < 'a' + CUSTOM_SLOTS) {
+            setStage(FIRST_CUSTOM_STAGE + (name[5] - 'a'));
+            say("{}", stageText());
         }
         else if (name == "export") {
             exportConsole();
